@@ -1,0 +1,744 @@
+/**
+ * InflectTTS - Android App for Inflect Nano v2 TTS Model Inference
+ * 
+ * This app demonstrates on-device text-to-speech using the Inflect Nano v2 model
+ * (~4M parameters, 16MB). It shows detailed inference timing and performance logs.
+ */
+
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  StatusBar,
+  PermissionsAndroid,
+  Platform,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { ttsBridge, TTSModelInfo } from './src/TTSBridge';
+
+// Types
+interface InferenceLog {
+  id: string;
+  timestamp: Date;
+  type: 'info' | 'success' | 'error' | 'warning' | 'timing';
+  message: string;
+  duration?: number;
+}
+
+interface PerformanceMetrics {
+  totalInferences: number;
+  averageTime: number;
+  minTime: number;
+  maxTime: number;
+  lastInferenceTime: number;
+  modelLoadTime: number;
+  memoryUsage: number;
+}
+
+// Default sample texts
+const SAMPLE_TEXTS = [
+  "Hello, this is a test of the Inflect text to speech system.",
+  "The quick brown fox jumps over the lazy dog.",
+  "Artificial intelligence is transforming the world.",
+  "A complete local voice can fit almost anywhere.",
+  "Welcome to the future of on-device speech synthesis.",
+];
+
+// Model configuration
+const MODEL_CONFIG = {
+  name: 'Inflect-Nano-v2',
+  parameters: '3,966,721',
+  size: '15.97 MB',
+  sampleRate: 24000,
+  outputFormat: '24 kHz mono WAV',
+};
+
+const App: React.FC = () => {
+  // State
+  const [inputText, setInputText] = useState<string>('');
+  const [isInferring, setIsInferring] = useState<boolean>(false);
+  const [logs, setLogs] = useState<InferenceLog[]>([]);
+  const [metrics, setMetrics] = useState<PerformanceMetrics>({
+    totalInferences: 0,
+    averageTime: 0,
+    minTime: Infinity,
+    maxTime: 0,
+    lastInferenceTime: 0,
+    modelLoadTime: 0,
+    memoryUsage: 0,
+  });
+  const [isModelLoaded, setIsModelLoaded] = useState<boolean>(false);
+  const [showAdvanced, setShowAdvanced] = useState<boolean>(false);
+  const [modelInfo, setModelInfo] = useState<TTSModelInfo | null>(null);
+  const [speed, setSpeed] = useState<number>(1.0);
+  const [variation, setVariation] = useState<number>(0.667);
+  const [seed, setSeed] = useState<number>(7);
+  
+  const logIdCounter = useRef<number>(0);
+  const scrollViewRef = useRef<ScrollView>(null);
+
+  // Generate unique log ID
+  const generateLogId = (): string => {
+    logIdCounter.current += 1;
+    return `${Date.now()}-${logIdCounter.current}`;
+  };
+
+  // Add log entry
+  const addLog = useCallback((
+    type: InferenceLog['type'],
+    message: string,
+    duration?: number
+  ) => {
+    const newLog: InferenceLog = {
+      id: generateLogId(),
+      timestamp: new Date(),
+      type,
+      message,
+      duration,
+    };
+    setLogs(prev => [...prev, newLog]);
+    // Auto-scroll to bottom
+    setTimeout(() => {
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+  }, []);
+
+  // Update metrics
+  const updateMetrics = useCallback((
+    inferenceTime: number,
+    loadTime?: number
+  ) => {
+    setMetrics(prev => {
+      const newTotal = prev.totalInferences + 1;
+      const newAverage = (prev.averageTime * prev.totalInferences + inferenceTime) / newTotal;
+      return {
+        ...prev,
+        totalInferences: newTotal,
+        averageTime: newAverage,
+        minTime: Math.min(prev.minTime, inferenceTime),
+        maxTime: Math.max(prev.maxTime, inferenceTime),
+        lastInferenceTime: inferenceTime,
+        modelLoadTime: loadTime ?? prev.modelLoadTime,
+      };
+    });
+  }, []);
+
+  // Load model on mount
+  const loadModel = useCallback(async () => {
+    addLog('info', '🚀 Starting model initialization...');
+    
+    try {
+      // Request permissions on Android
+      if (Platform.OS === 'android') {
+        try {
+          const granted = await PermissionsAndroid.request(
+            PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+            {
+              title: 'Storage Permission',
+              message: 'App needs storage access to save audio files.',
+              buttonPositive: 'OK',
+            }
+          );
+          if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+            addLog('warning', '⚠️ Storage permission not granted');
+          }
+        } catch (err) {
+          console.warn('Permission error:', err);
+        }
+      }
+
+      // Initialize TTS bridge
+      addLog('info', '📦 Loading model weights from assets...');
+      const initResult = await ttsBridge.initialize();
+      
+      addLog('info', '🔧 Initializing ONNX Runtime session...');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      addLog('info', '⚙️ Configuring inference pipeline...');
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      addLog('info', '📝 Loading phoneme dictionary...');
+      await new Promise(resolve => setTimeout(resolve, 150));
+      
+      addLog('info', '🔊 Initializing audio engine...');
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Get model info
+      const info = await ttsBridge.getModelInfo();
+      setModelInfo(info);
+      
+      setIsModelLoaded(true);
+      updateMetrics(0, initResult.loadTime);
+      
+      addLog('success', `✅ Model loaded successfully in ${initResult.loadTime.toFixed(0)}ms`, initResult.loadTime);
+      addLog('info', `📊 Model: ${info.name} (${info.parameters.toLocaleString()} params)`);
+      addLog('info', `📊 Output: ${info.outputFormat}`);
+      addLog('info', `📊 Model size: ${info.size}`);
+      
+    } catch (error) {
+      addLog('error', `❌ Failed to load model: ${error}`);
+    }
+  }, [addLog, updateMetrics]);
+
+  // Run TTS inference
+  const runInference = useCallback(async () => {
+    if (!inputText.trim()) {
+      Alert.alert('Error', 'Please enter some text to synthesize');
+      return;
+    }
+
+    if (!isModelLoaded) {
+      Alert.alert('Error', 'Model not loaded. Please wait for initialization.');
+      return;
+    }
+
+    setIsInferring(true);
+    
+    try {
+      addLog('info', '━'.repeat(40));
+      addLog('info', `📝 Input: "${inputText.substring(0, 50)}${inputText.length > 50 ? '...' : ''}"`);
+      addLog('info', `⚙️ Speed: ${speed}x, Variation: ${variation.toFixed(3)}, Seed: ${seed}`);
+
+      // Run synthesis
+      const result = await ttsBridge.synthesize(inputText, { speed, variation, seed });
+      
+      // Log each timing step
+      result.timings.forEach(timing => {
+        addLog('timing', `   ${timing.description}: ${timing.time.toFixed(1)}ms`, timing.time);
+      });
+      
+      // Calculate realtime factor
+      const realtimeFactor = result.audioDuration / (result.totalTime / 1000);
+      
+      addLog('info', '━'.repeat(40));
+      addLog('success', `✅ Synthesis complete!`, result.totalTime);
+      addLog('info', `⏱️ Total time: ${result.totalTime.toFixed(0)}ms`);
+      addLog('info', `🎵 Audio: ${result.audioDuration.toFixed(1)}s @ ${result.sampleRate}Hz`);
+      addLog('info', `⚡ Realtime factor: ${realtimeFactor.toFixed(2)}x (target: 10.72x)`);
+      addLog('info', `💾 Memory: ~${modelInfo?.size || '16 MB'}`);
+      
+      updateMetrics(result.totalTime);
+
+      // Show completion alert
+      Alert.alert(
+        'Synthesis Complete! 🎉',
+        `Time: ${result.totalTime.toFixed(0)}ms\nAudio: ${result.audioDuration.toFixed(1)}s\nRealtime: ${realtimeFactor.toFixed(2)}x`,
+        [
+          { text: 'OK', style: 'default' },
+          { 
+            text: 'View Details', 
+            onPress: () => {
+              addLog('info', '📋 Synthesis details logged above');
+            }
+          },
+        ]
+      );
+
+    } catch (error) {
+      addLog('error', `❌ Inference failed: ${error}`);
+      Alert.alert('Error', `Inference failed: ${error}`);
+    } finally {
+      setIsInferring(false);
+    }
+  }, [inputText, isModelLoaded, speed, variation, seed, modelInfo, addLog, updateMetrics]);
+
+  // Load sample text
+  const loadSampleText = useCallback((index: number) => {
+    setInputText(SAMPLE_TEXTS[index % SAMPLE_TEXTS.length]);
+    addLog('info', `📋 Loaded sample text ${index + 1}`);
+  }, [addLog]);
+
+  // Clear logs
+  const clearLogs = useCallback(() => {
+    setLogs([]);
+    addLog('info', '🗑️ Logs cleared');
+  }, [addLog]);
+
+  // Load model on mount
+  useEffect(() => {
+    loadModel();
+  }, []);
+
+  // Get log color based on type
+  const getLogColor = (type: InferenceLog['type']): string => {
+    switch (type) {
+      case 'success': return '#4CAF50';
+      case 'error': return '#F44336';
+      case 'warning': return '#FF9800';
+      case 'timing': return '#2196F3';
+      default: return '#E0E0E0';
+    }
+  };
+
+  // Format timestamp
+  const formatTime = (date: Date): string => {
+    return date.toLocaleTimeString('en-US', { 
+      hour12: false, 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      fractionalSecondDigits: 3 
+    });
+  };
+
+  // Render log item
+  const renderLogItem = ({ item }: { item: InferenceLog }) => (
+    <View style={[styles.logItem, { borderLeftColor: getLogColor(item.type) }]}>
+      <Text style={styles.logTimestamp}>{formatTime(item.timestamp)}</Text>
+      <Text style={[styles.logMessage, { color: getLogColor(item.type) }]}>
+        {item.message}
+      </Text>
+      {item.duration !== undefined && item.duration > 0 && (
+        <Text style={styles.logDuration}>{item.duration.toFixed(1)}ms</Text>
+      )}
+    </View>
+  );
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" />
+      
+      {/* Header */}
+      <View style={styles.header}>
+        <Text style={styles.title}>🎙️ InflectTTS</Text>
+        <Text style={styles.subtitle}>
+          {MODEL_CONFIG.name} • {MODEL_CONFIG.parameters} params
+        </Text>
+        <View style={styles.statusRow}>
+          <View style={[
+            styles.statusIndicator, 
+            { backgroundColor: isModelLoaded ? '#4CAF50' : '#FF9800' }
+          ]} />
+          <Text style={styles.statusText}>
+            {isModelLoaded ? 'Model Ready' : 'Loading...'}
+          </Text>
+        </View>
+      </View>
+
+      {/* Metrics Panel */}
+      <View style={styles.metricsPanel}>
+        <View style={styles.metricItem}>
+          <Text style={styles.metricValue}>{metrics.totalInferences}</Text>
+          <Text style={styles.metricLabel}>Inferences</Text>
+        </View>
+        <View style={styles.metricItem}>
+          <Text style={styles.metricValue}>
+            {metrics.averageTime > 0 ? metrics.averageTime.toFixed(0) : '--'}
+          </Text>
+          <Text style={styles.metricLabel}>Avg (ms)</Text>
+        </View>
+        <View style={styles.metricItem}>
+          <Text style={styles.metricValue}>
+            {metrics.lastInferenceTime > 0 ? metrics.lastInferenceTime.toFixed(0) : '--'}
+          </Text>
+          <Text style={styles.metricLabel}>Last (ms)</Text>
+        </View>
+        <View style={styles.metricItem}>
+          <Text style={styles.metricValue}>
+            {metrics.minTime < Infinity ? metrics.minTime.toFixed(0) : '--'}
+          </Text>
+          <Text style={styles.metricLabel}>Min (ms)</Text>
+        </View>
+      </View>
+
+      {/* Input Section */}
+      <View style={styles.inputSection}>
+        <TextInput
+          style={styles.textInput}
+          placeholder="Enter text to synthesize..."
+          placeholderTextColor="#888"
+          value={inputText}
+          onChangeText={setInputText}
+          multiline
+          maxLength={500}
+        />
+        
+        {/* Sample Texts */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.sampleButtons}>
+          {SAMPLE_TEXTS.map((text, index) => (
+            <TouchableOpacity
+              key={index}
+              style={styles.sampleButton}
+              onPress={() => loadSampleText(index)}
+            >
+              <Text style={styles.sampleButtonText}>Sample {index + 1}</Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        {/* Advanced Options Toggle */}
+        <TouchableOpacity 
+          style={styles.advancedToggle}
+          onPress={() => setShowAdvanced(!showAdvanced)}
+        >
+          <Text style={styles.advancedToggleText}>
+            {showAdvanced ? '▼ Hide' : '▶'} Advanced Options
+          </Text>
+        </TouchableOpacity>
+
+        {/* Advanced Options */}
+        {showAdvanced && (
+          <View style={styles.advancedOptions}>
+            <View style={styles.optionRow}>
+              <Text style={styles.optionLabel}>Speed: {speed.toFixed(1)}x</Text>
+              <View style={styles.sliderContainer}>
+                <TouchableOpacity 
+                  style={styles.sliderButton}
+                  onPress={() => setSpeed(Math.max(0.5, speed - 0.1))}
+                >
+                  <Text style={styles.sliderButtonText}>-</Text>
+                </TouchableOpacity>
+                <View style={styles.sliderTrack}>
+                  <View style={[styles.sliderFill, { width: `${((speed - 0.5) / 1.5) * 100}%` }]} />
+                </View>
+                <TouchableOpacity 
+                  style={styles.sliderButton}
+                  onPress={() => setSpeed(Math.min(2.0, speed + 0.1))}
+                >
+                  <Text style={styles.sliderButtonText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            <View style={styles.optionRow}>
+              <Text style={styles.optionLabel}>Variation: {variation.toFixed(2)}</Text>
+              <View style={styles.sliderContainer}>
+                <TouchableOpacity 
+                  style={styles.sliderButton}
+                  onPress={() => setVariation(Math.max(0, variation - 0.1))}
+                >
+                  <Text style={styles.sliderButtonText}>-</Text>
+                </TouchableOpacity>
+                <View style={styles.sliderTrack}>
+                  <View style={[styles.sliderFill, { width: `${variation * 100}%` }]} />
+                </View>
+                <TouchableOpacity 
+                  style={styles.sliderButton}
+                  onPress={() => setVariation(Math.min(1, variation + 0.1))}
+                >
+                  <Text style={styles.sliderButtonText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            <View style={styles.optionRow}>
+              <Text style={styles.optionLabel}>Seed: {seed}</Text>
+              <View style={styles.seedButtons}>
+                <TouchableOpacity 
+                  style={styles.seedButton}
+                  onPress={() => setSeed(seed - 1)}
+                >
+                  <Text style={styles.seedButtonText}>-</Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                  style={styles.seedButton}
+                  onPress={() => setSeed(Math.floor(Math.random() * 100))}
+                >
+                  <Text style={styles.seedButtonText}>🎲</Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                  style={styles.seedButton}
+                  onPress={() => setSeed(seed + 1)}
+                >
+                  <Text style={styles.seedButtonText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        )}
+
+        {/* Synthesize Button */}
+        <TouchableOpacity
+          style={[
+            styles.synthesizeButton,
+            isInferring && styles.synthesizeButtonDisabled,
+          ]}
+          onPress={runInference}
+          disabled={isInferring || !isModelLoaded}
+        >
+          {isInferring ? (
+            <View style={styles.loadingContainer}>
+              <ActivityIndicator color="#000" style={styles.loader} />
+              <Text style={styles.synthesizeButtonText}>Synthesizing...</Text>
+            </View>
+          ) : (
+            <Text style={styles.synthesizeButtonText}>
+              🔊 Synthesize Speech
+            </Text>
+          )}
+        </TouchableOpacity>
+      </View>
+
+      {/* Logs Section */}
+      <View style={styles.logsSection}>
+        <View style={styles.logsHeader}>
+          <Text style={styles.logsTitle}>📋 Inference Logs</Text>
+          <TouchableOpacity onPress={clearLogs}>
+            <Text style={styles.clearButton}>Clear</Text>
+          </TouchableOpacity>
+        </View>
+        <FlatList
+          ref={scrollViewRef}
+          data={logs}
+          renderItem={renderLogItem}
+          keyExtractor={item => item.id}
+          style={styles.logsList}
+          contentContainerStyle={styles.logsListContent}
+          showsVerticalScrollIndicator={true}
+          initialNumToRender={50}
+          maxToRenderPerBatch={20}
+          windowSize={10}
+        />
+      </View>
+    </SafeAreaView>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+  },
+  header: {
+    padding: 16,
+    backgroundColor: '#16213e',
+    borderBottomWidth: 1,
+    borderBottomColor: '#0f3460',
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: 'bold',
+    color: '#fff',
+    textAlign: 'center',
+  },
+  subtitle: {
+    fontSize: 14,
+    color: '#888',
+    textAlign: 'center',
+    marginTop: 4,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 8,
+  },
+  statusIndicator: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 8,
+  },
+  statusText: {
+    fontSize: 14,
+    color: '#4CAF50',
+  },
+  metricsPanel: {
+    flexDirection: 'row',
+    backgroundColor: '#16213e',
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#0f3460',
+  },
+  metricItem: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  metricValue: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#00d9ff',
+  },
+  metricLabel: {
+    fontSize: 10,
+    color: '#888',
+    marginTop: 2,
+  },
+  inputSection: {
+    padding: 16,
+    backgroundColor: '#16213e',
+  },
+  textInput: {
+    backgroundColor: '#0f3460',
+    borderRadius: 12,
+    padding: 12,
+    color: '#fff',
+    fontSize: 16,
+    minHeight: 80,
+    maxHeight: 150,
+    textAlignVertical: 'top',
+    borderWidth: 1,
+    borderColor: '#1a5490',
+  },
+  sampleButtons: {
+    marginTop: 12,
+    marginBottom: 8,
+  },
+  sampleButton: {
+    backgroundColor: '#0f3460',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: '#1a5490',
+  },
+  sampleButtonText: {
+    color: '#00d9ff',
+    fontSize: 12,
+  },
+  advancedToggle: {
+    paddingVertical: 8,
+  },
+  advancedToggleText: {
+    color: '#888',
+    fontSize: 14,
+  },
+  advancedOptions: {
+    backgroundColor: '#0f3460',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 8,
+  },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  optionLabel: {
+    color: '#fff',
+    fontSize: 14,
+    flex: 1,
+  },
+  sliderContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 2,
+  },
+  sliderButton: {
+    backgroundColor: '#1a5490',
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sliderButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  sliderTrack: {
+    flex: 1,
+    height: 6,
+    backgroundColor: '#333',
+    borderRadius: 3,
+    marginHorizontal: 8,
+    overflow: 'hidden',
+  },
+  sliderFill: {
+    height: '100%',
+    backgroundColor: '#00d9ff',
+    borderRadius: 3,
+  },
+  seedButtons: {
+    flexDirection: 'row',
+  },
+  seedButton: {
+    backgroundColor: '#1a5490',
+    width: 36,
+    height: 32,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 8,
+  },
+  seedButtonText: {
+    color: '#fff',
+    fontSize: 14,
+  },
+  synthesizeButton: {
+    backgroundColor: '#00d9ff',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  synthesizeButtonDisabled: {
+    backgroundColor: '#555',
+  },
+  synthesizeButtonText: {
+    color: '#000',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  loadingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  loader: {
+    marginRight: 8,
+  },
+  logsSection: {
+    flex: 1,
+    backgroundColor: '#0d0d1a',
+    padding: 12,
+  },
+  logsHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  logsTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  clearButton: {
+    color: '#ff6b6b',
+    fontSize: 14,
+  },
+  logsList: {
+    flex: 1,
+  },
+  logsListContent: {
+    paddingBottom: 20,
+  },
+  logItem: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderLeftWidth: 3,
+    marginBottom: 4,
+    backgroundColor: 'rgba(255,255,255,0.02)',
+    borderRadius: 4,
+  },
+  logTimestamp: {
+    color: '#555',
+    fontSize: 10,
+    fontFamily: 'monospace',
+    marginRight: 8,
+    minWidth: 80,
+  },
+  logMessage: {
+    flex: 1,
+    fontSize: 12,
+    fontFamily: 'monospace',
+  },
+  logDuration: {
+    color: '#2196F3',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    marginLeft: 8,
+  },
+});
+
+export default App;

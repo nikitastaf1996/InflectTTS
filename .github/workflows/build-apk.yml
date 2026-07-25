@@ -1,0 +1,239 @@
+name: Build APK
+
+# Auto-release GitHub Actions workflow for InflectTTS Android App
+# Builds the React Native Android app and publishes to GitHub Releases
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.1.12297006"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.1.12297006" >> $GITHUB_ENV
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Create assets directory
+        run: mkdir -p android/app/src/main/assets
+
+      - name: Bundle JS for Android
+        run: npm run bundle:android
+
+      - name: Generate debug keystore
+        working-directory: android/app
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "✓ Generated debug.keystore"
+          else
+            echo "✓ debug.keystore already exists"
+          fi
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build release APK
+        id: buildRelease
+        working-directory: android
+        continue-on-error: true
+        run: ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: If release failed, try debug APK
+        working-directory: android
+        if: steps.buildRelease.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "::warning::Release build failed; falling back to debug build"
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: android/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload APK as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0
+
+      - name: Verify APK exists
+        if: always()
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk android/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK was built. Check the build-log artifact for the Gradle error."
+            exit 1
+          fi
+          echo "✓ APK: $APK"
+          ls -lh "$APK"
+
+      - name: Stage APK for release
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk android/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK to publish"
+            exit 1
+          fi
+          cp "$APK" InflectTTS-latest.apk
+          ls -lh InflectTTS-latest.apk
+
+      - name: Publish / update rolling 'latest' prerelease
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          prerelease: true
+          body: |
+            ## InflectTTS Latest Build
+
+            Auto-published from the most recent push to `main`.
+
+            This APK contains the Inflect Nano v2 TTS model demonstration app with:
+            - Real-time inference timing and logs
+            - Configurable speed and variation controls
+            - Sample texts for testing
+            - Native Android audio playback
+
+            ### Model Info
+            - **Model:** Inflect-Nano-v2
+            - **Parameters:** 3,966,721
+            - **Size:** ~16 MB
+            - **Output:** 24 kHz mono WAV
+
+            ### Build Info
+            - **Commit:** [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+            - **Pushed:** ${{ github.event.head_commit.timestamp }}
+            - **Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            This release is overwritten on every push.
+          files: |
+            InflectTTS-latest.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: Also build a release variant with bundled model
+  build-with-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    if: false  # Set to true if you have the ONNX model file
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.1.12297006"
+
+      - name: Set up Python for ONNX export
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download and export model
+        run: |
+          pip install torch onnx huggingface_hub
+          python scripts/export_onnx.py --model nano --output ./exported_model --download
+          mkdir -p android/app/src/main/assets
+          cp exported_model/* android/app/src/main/assets/
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: model-bundle
+          name: Build with ONNX Model
+          prerelease: true
+          files: android/app/build/outputs/apk/release/app-release.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
