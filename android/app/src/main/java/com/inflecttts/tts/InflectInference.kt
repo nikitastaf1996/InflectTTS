@@ -412,7 +412,18 @@ class InflectInference(private val context: Context) {
         }
         Log.i(TAG, "step=$lastInferenceStep: OK — zP size=${zP.size}")
 
-        // -------- 6. flow.forward(z_p, y_mask, reverse=True) -> z --------
+        // -------- 6. flow.forward(z_p, y_mask, g=None, reverse=True) -> z --------
+        // From runtime/models.py SynthesizerTrn.infer() line 581:
+        //   z = self.flow(z_p, y_mask, g=g, reverse=True)
+        // ResidualCouplingBlock.forward signature (line 215):
+        //   forward(self, x, x_mask, g: Optional[Tensor] = None, reverse: bool = False)
+        //
+        // 4 args: x (z_p), x_mask (y_mask), g (None for n_speakers=0), reverse.
+        // v2.3.1 passed only 3 args (missing g) — crashed at flow_forward
+        // with native SIGSEGV.
+        //
+        // For Optional[Tensor] args, TorchScript accepts IValue.optionalNull()
+        // which represents Python None.
         lastInferenceStep = "flow_forward"
         val zPTensor = Tensor.fromBlob(zP, longArrayOf(1, inter.toLong(), yLengths.toLong()))
         val yMaskT = Tensor.fromBlob(
@@ -420,32 +431,41 @@ class InflectInference(private val context: Context) {
             longArrayOf(1, 1, yLengths.toLong()),
         )
         Log.i(TAG, "step=$lastInferenceStep: calling flow.forward(z_p=${zPTensor.shape().contentToString()}, " +
-            "y_mask=${yMaskT.shape().contentToString()}, reverse=true)")
+            "y_mask=${yMaskT.shape().contentToString()}, g=None, reverse=true) [4-arg, per source]")
         val zTensor = flow!!.forward(
             IValue.from(zPTensor),
             IValue.from(yMaskT),
+            IValue.optionalNull(),
             IValue.from(true),
         ).toTensor()
         Log.i(TAG, "step=$lastInferenceStep: OK — z=${zTensor.shape().contentToString()}")
 
-        // -------- 7. dec.forward(z * y_mask, max_len=4000) -> waveform --------
-        // Per the HF README reconstruction step 9:
-        //   o = dec.forward(z * y_mask, max_len=4000)
-        // The scripted decoder takes TWO args: the latent z (already
-        // masked) and max_len (int). The previous version passed only 1
-        // arg, which likely triggered the native SIGSEGV crash.
+        // -------- 7. dec.forward(z * y_mask[:,:,:max_len], g=None) -> waveform --------
+        // From runtime/models.py SynthesizerTrn.infer() line 582:
+        //   o = self.dec((z * y_mask)[:,:,:max_len], g=g)
         //
-        // Apply y_mask to z first (z * y_mask), then forward with max_len.
+        // Generator.forward signature takes (z, g) — NOT (z, max_len)!
+        // max_len is applied via SLICING before the call: (z * y_mask)[:,:,:max_len]
+        // v2.2.1 incorrectly passed max_len as the second arg — that would
+        // crash at dec_forward (we haven't reached it yet because flow_forward
+        // crashed first, but it needs fixing too).
+        //
+        // Apply y_mask to z (y_mask is all-ones in valid region, so z is
+        // unchanged), then slice to max_len, then forward with g=None.
         lastInferenceStep = "dec_forward"
-        // z * y_mask — y_mask is [1, 1, y_len] of ones, so for valid
-        // regions z is unchanged. We just pass z directly since y_mask
-        // is all-ones in the valid region (we built it that way).
         val maxLen = 4000
-        Log.i(TAG, "step=$lastInferenceStep: calling dec.forward(z=${zTensor.shape().contentToString()}, " +
-            "max_len=$maxLen) [2-arg, per HF README]")
+        // Slice z to [:,:,:maxLen] — z shape is [1, inter, yLengths]
+        val zSlicedLen = min(yLengths, maxLen)
+        Log.i(TAG, "step=$lastInferenceStep: calling dec.forward(z[:,:,:$zSlicedLen], g=None) " +
+            "[2-arg: z + g, per source; max_len applied via slicing]")
+        // Build a sliced z tensor (z is already masked since y_mask is all-ones)
+        val zSliced = Tensor.fromBlob(
+            zTensor.getDataAsFloatArray().copyOfRange(0, inter * zSlicedLen),
+            longArrayOf(1, inter.toLong(), zSlicedLen.toLong()),
+        )
         val outTensor = dec!!.forward(
-            IValue.from(zTensor),
-            IValue.from(maxLen.toLong()),
+            IValue.from(zSliced),
+            IValue.optionalNull(),
         ).toTensor()
         Log.i(TAG, "step=$lastInferenceStep: OK — out=${outTensor.shape().contentToString()}")
 
