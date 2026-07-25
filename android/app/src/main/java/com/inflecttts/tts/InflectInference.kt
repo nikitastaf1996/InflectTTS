@@ -78,18 +78,27 @@ class InflectInference(private val context: Context) {
      * one attempted if a crash killed the process). @Volatile so it's
      * visible from the JS thread when [TTSModule.getDiagnostics] is called.
      *
-     * Values: "init", "prepare_tokens", "enc_p_forward", "dp_forward",
-     * "compute_durations", "build_attention", "expand_m_p", "sample_z_p",
-     * "flow_forward", "dec_forward", "done".
+     * Values: "init", "synthesize_called", "coroutine_entered",
+     * "preprocessing", "phoneme_encoding", "prepare_tokens",
+     * "enc_p_forward", "dp_forward", "compute_durations",
+     * "build_attention", "expand_m_p", "sample_z_p", "flow_forward",
+     * "dec_forward", "post_processing", "save_wav", "play_audio",
+     * "resolve_promise", "done".
+     *
+     * Setter is public so [TTSModule] can write it from its own
+     * orchestration steps (before/after infer()).
      */
     @Volatile
     var lastInferenceStep: String = "init"
-        private set
+        public set
 
-    /** Inputs used for the last inference (for crash post-mortem). */
+    /**
+     * Inputs used for the last inference (for crash post-mortem).
+     * Setter is public so [TTSModule] can write it at synthesize() entry.
+     */
     @Volatile
     var lastInferenceInputs: String = ""
-        private set
+        public set
 
     /**
      * Load all five `.pt` submodules. Throws on any failure with a
