@@ -1,5 +1,6 @@
 package com.inflecttts.tts
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -40,13 +41,25 @@ import kotlin.random.Random
  * the APK does not bundle ~20 MB of LFS-backed binaries.
  */
 class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
-    
+
     companion object {
         const val NAME = "InflectTTS"
         private const val TAG = "InflectTTS"
         private const val SAMPLE_RATE = 24000
         private const val MODEL_PARAMS = 3966721
+
+        /** SharedPreferences file for crash-postmortem fields. */
+        private const val PREFS_NAME = "inflect_tts_crash_postmortem"
+        private const val PREF_LAST_STEP = "lastInferenceStep"
+        private const val PREF_LAST_INPUTS = "lastInferenceInputs"
+        private const val PREF_ATTEMPTS = "inferenceAttempts"
+        private const val PREF_SUCCESSES = "inferenceSuccesses"
+        private const val PREF_LAST_ERROR = "lastInferenceError"
+        private const val PREF_LAST_ERROR_STACK = "lastInferenceErrorStacktrace"
     }
+
+    /** SharedPreferences for crash post-mortem — survives process crashes. */
+    private val crashPrefs = reactContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var audioTrack: AudioTrack? = null
@@ -87,22 +100,55 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
     /**
      * Last inference (synthesize) failure reason, captured so the user
      * can see WHY synthesis failed even if the app crashes immediately
-     * after. Cleared at the start of each successful synthesis.
+     * after. Persisted to SharedPreferences so it survives process crashes.
      */
     @Volatile
-    private var lastInferenceError: String? = null
+    private var lastInferenceError: String? = crashPrefs.getString(PREF_LAST_ERROR, null)
 
-    /** Full stack trace of the last inference failure. */
+    /** Full stack trace of the last inference failure. Persisted to disk. */
     @Volatile
-    private var lastInferenceErrorStacktrace: String? = null
+    private var lastInferenceErrorStacktrace: String? = crashPrefs.getString(PREF_LAST_ERROR_STACK, null)
 
-    /** Total number of synthesis attempts (success + failure). */
+    /**
+     * Total number of synthesis attempts. Persisted to SharedPreferences
+     * so the count survives process crashes (SIGSEGV).
+     */
     @Volatile
-    private var inferenceAttempts: Int = 0
+    private var inferenceAttempts: Int = crashPrefs.getInt(PREF_ATTEMPTS, 0)
 
-    /** Total number of successful syntheses. */
+    /** Total number of successful syntheses. Persisted to disk. */
     @Volatile
-    private var inferenceSuccesses: Int = 0
+    private var inferenceSuccesses: Int = crashPrefs.getInt(PREF_SUCCESSES, 0)
+
+    /**
+     * Persist a crash-postmortem field to SharedPreferences using commit()
+     * (synchronous write to disk). This ensures the value is flushed BEFORE
+     * the next native call that might crash the process.
+     *
+     * We use commit() (sync) instead of apply() (async) because apply()
+     * might not finish writing before a SIGSEGV kills the process.
+     */
+    private fun persistStep(step: String, inputs: String? = null) {
+        val ed = crashPrefs.edit()
+        ed.putString(PREF_LAST_STEP, step)
+        if (inputs != null) ed.putString(PREF_LAST_INPUTS, inputs)
+        ed.commit()  // synchronous disk write
+    }
+
+    private fun persistAttempts() {
+        crashPrefs.edit().putInt(PREF_ATTEMPTS, inferenceAttempts).commit()
+    }
+
+    private fun persistSuccesses() {
+        crashPrefs.edit().putInt(PREF_SUCCESSES, inferenceSuccesses).commit()
+    }
+
+    private fun persistError(error: String?, stacktrace: String?) {
+        crashPrefs.edit()
+            .putString(PREF_LAST_ERROR, error)
+            .putString(PREF_LAST_ERROR_STACK, stacktrace)
+            .commit()
+    }
 
     /** Pulls the five `.pt` files from HuggingFace on first run. */
     private val modelDownloader = ModelDownloader(reactContext)
@@ -425,7 +471,9 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
 
         // Increment the attempt counter IMMEDIATELY (before scope.launch)
         // so we can detect crashes that happen during coroutine startup.
+        // Persist to disk synchronously so it survives a process crash.
         inferenceAttempts += 1
+        persistAttempts()
         inference.lastInferenceStep = "synthesize_called"
         inference.lastInferenceInputs = "text.len=${text.length}, speed=$speed, " +
             "variation=$variation, seed=$seed"
@@ -485,12 +533,14 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                     val fullMsg = "Inference failed: $reason"
                     lastInferenceError = fullMsg
                     lastInferenceErrorStacktrace = stackTraceToString(t)
+                    persistError(fullMsg, lastInferenceErrorStacktrace)
                     Log.e(TAG, fullMsg, t)
                     throw RuntimeException(fullMsg, t)
                 }
                 // Inference succeeded — clear any previous inference error.
                 lastInferenceError = null
                 lastInferenceErrorStacktrace = null
+                persistError(null, null)
                 val synthTime = (System.nanoTime() - synthStart) / 1_000_000.0
                 timings.putDouble("waveformSynthesis", synthTime)
 
@@ -504,6 +554,7 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
 
                 val totalTime = (System.nanoTime() - totalStart) / 1_000_000.0
                 inferenceSuccesses += 1
+                persistSuccesses()
 
                 results.pushMap(Arguments.createMap().apply {
                     putString("step", "preprocessing"); putDouble("time", preprocessTime)
@@ -552,6 +603,7 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 lastInferenceError = "Synthesis failed at step=${inference.lastInferenceStep}: " +
                     buildFailureReason(e)
                 lastInferenceErrorStacktrace = stackTraceToString(e)
+                persistError(lastInferenceError, lastInferenceErrorStacktrace)
                 withContext(Dispatchers.Main) {
                     promise.reject("SYNTHESIS_ERROR", e.message, e)
                 }
@@ -607,13 +659,19 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 result.putString("loadFailureStacktrace", loadFailureStacktrace)
                 result.putDouble("loadTime", modelLoadTime.toDouble())
 
-                // ---- Inference stats (useful when debugging synthesize()
-                // failures or app crashes during synthesis) ----
-                result.putInt("inferenceAttempts", inferenceAttempts)
-                result.putInt("inferenceSuccesses", inferenceSuccesses)
-                result.putInt("inferenceFailures", inferenceAttempts - inferenceSuccesses)
-                result.putString("lastInferenceError", lastInferenceError)
-                result.putString("lastInferenceErrorStacktrace", lastInferenceErrorStacktrace)
+                // ---- Inference stats ----
+                // Re-read from SharedPreferences to get the freshest persisted
+                // values (in case the @Volatile fields haven't been updated
+                // yet by a different thread, or the process just restarted).
+                val persistedAttempts = crashPrefs.getInt(PREF_ATTEMPTS, 0)
+                val persistedSuccesses = crashPrefs.getInt(PREF_SUCCESSES, 0)
+                val persistedError = crashPrefs.getString(PREF_LAST_ERROR, null)
+                val persistedErrorStack = crashPrefs.getString(PREF_LAST_ERROR_STACK, null)
+                result.putInt("inferenceAttempts", persistedAttempts)
+                result.putInt("inferenceSuccesses", persistedSuccesses)
+                result.putInt("inferenceFailures", persistedAttempts - persistedSuccesses)
+                result.putString("lastInferenceError", persistedError)
+                result.putString("lastInferenceErrorStacktrace", persistedErrorStack)
 
                 // File-level diagnostics
                 val dir = File(reactApplicationContext.filesDir, ModelDownloader.MODEL_DIR_NAME)

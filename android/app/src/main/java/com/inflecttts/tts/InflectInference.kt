@@ -56,7 +56,15 @@ class InflectInference(private val context: Context) {
 
         /** Model inter_channels (matches `config.json` `inter_channels`). */
         const val INTER_CHANNELS = 128
+
+        /** SharedPreferences file for crash-postmortem (shared with TTSModule). */
+        private const val PREFS_NAME = "inflect_tts_crash_postmortem"
+        private const val PREF_LAST_STEP = "lastInferenceStep"
+        private const val PREF_LAST_INPUTS = "lastInferenceInputs"
     }
+
+    /** SharedPreferences for crash post-mortem — survives process crashes. */
+    private val crashPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     /** Path of the on-disk model directory. */
     private val modelDir: File
@@ -75,8 +83,13 @@ class InflectInference(private val context: Context) {
 
     /**
      * The name of the inference step currently being executed (or the last
-     * one attempted if a crash killed the process). @Volatile so it's
-     * visible from the JS thread when [TTSModule.getDiagnostics] is called.
+     * one attempted if a crash killed the process).
+     *
+     * IMPORTANT: This field is ALSO persisted to SharedPreferences on every
+     * write, because @Volatile only guarantees cross-thread visibility WITHIN
+     * the same process — it does NOT survive a process crash (SIGSEGV).
+     * When the app crashes and relaunches, the field is re-loaded from disk
+     * so getDiagnostics() can report which step crashed.
      *
      * Values: "init", "synthesize_called", "coroutine_entered",
      * "preprocessing", "phoneme_encoding", "prepare_tokens",
@@ -86,19 +99,26 @@ class InflectInference(private val context: Context) {
      * "resolve_promise", "done".
      *
      * Setter is public so [TTSModule] can write it from its own
-     * orchestration steps (before/after infer()).
+     * orchestration steps (before/after infer()). Every write is
+     * synchronously flushed to disk via commit().
      */
     @Volatile
-    var lastInferenceStep: String = "init"
-        public set
+    var lastInferenceStep: String = crashPrefs.getString(PREF_LAST_STEP, "init") ?: "init"
+        set(value) {
+            field = value
+            crashPrefs.edit().putString(PREF_LAST_STEP, value).commit()
+        }
 
     /**
      * Inputs used for the last inference (for crash post-mortem).
-     * Setter is public so [TTSModule] can write it at synthesize() entry.
+     * Persisted to SharedPreferences on every write.
      */
     @Volatile
-    var lastInferenceInputs: String = ""
-        public set
+    var lastInferenceInputs: String = crashPrefs.getString(PREF_LAST_INPUTS, "") ?: ""
+        set(value) {
+            field = value
+            crashPrefs.edit().putString(PREF_LAST_INPUTS, value).commit()
+        }
 
     /**
      * Load all five `.pt` submodules. Throws on any failure with a
