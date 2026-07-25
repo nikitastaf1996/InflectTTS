@@ -18,4 +18,17 @@ buildscript {
     }
 }
 
+// Repository config for `implementation(...)` deps declared in
+// app/build.gradle (e.g. org.pytorch:pytorch_android). React Native's
+// settings plugin sets up some repos automatically, but declaring
+// this explicitly guarantees Maven Central / Google are available.
+allprojects {
+    repositories {
+        mavenLocal()
+        google()
+        mavenCentral()
+        maven { url = uri("https://www.jitpack.io") }
+    }
+}
+
 apply plugin: "com.facebook.react.rootproject"

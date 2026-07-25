@@ -132,8 +132,32 @@ const App: React.FC = () => {
 
   // Load model on mount
   const loadModel = useCallback(async () => {
-    addLog('info', '🚀 Starting model initialization...');
-    
+    addLog('info', '🚀 Starting model initialization (v2.0 submodule pathway)...');
+
+    // Subscribe to native model-download progress events emitted by TTSModule.
+    let progressSubscription: any = null;
+    try {
+      const { DeviceEventEmitter } = require('react-native');
+      progressSubscription = DeviceEventEmitter.addListener(
+        'InflectTTS_ModelProgress',
+        (event: { phase: string; message: string; progress: number }) => {
+          const pct = Math.max(0, Math.min(100, Math.round((event.progress || 0) * 100)));
+          const icon =
+            event.phase === 'download_start' ? '📥'
+            : event.phase === 'downloading' ? '⬇️'
+            : event.phase === 'file_done' ? '✓'
+            : event.phase === 'download_done' ? '✅'
+            : event.phase === 'cached' ? '💾'
+            : event.phase === 'model_loaded' ? '🧠'
+            : event.phase === 'model_load_failed' ? '⚠️'
+            : 'ℹ️';
+          addLog('info', `${icon} ${event.message} (${pct}%)`);
+        }
+      );
+    } catch (e) {
+      // DeviceEventEmitter may be unavailable in some environments.
+    }
+
     try {
       // Request permissions on Android
       if (Platform.OS === 'android') {
@@ -154,36 +178,33 @@ const App: React.FC = () => {
         }
       }
 
-      // Initialize TTS bridge
-      addLog('info', '📦 Loading model weights from assets...');
-      const initResult = await ttsBridge.initialize();
-      
-      addLog('info', '🔧 Initializing ONNX Runtime session...');
-      await new Promise(resolve => setTimeout(resolve, 200));
-      
-      addLog('info', '⚙️ Configuring inference pipeline...');
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      addLog('info', '📝 Loading phoneme dictionary...');
-      await new Promise(resolve => setTimeout(resolve, 150));
-      
-      addLog('info', '🔊 Initializing audio engine...');
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Initialize TTS bridge — this triggers the HuggingFace download on
+      // first run, then loads the five scripted submodules via PyTorch.
+      const initResult: any = await ttsBridge.initialize();
 
       // Get model info
       const info = await ttsBridge.getModelInfo();
       setModelInfo(info);
-      
+
       setIsModelLoaded(true);
       updateMetrics(0, initResult.loadTime);
-      
-      addLog('success', `✅ Model loaded successfully in ${initResult.loadTime.toFixed(0)}ms`, initResult.loadTime);
+
+      addLog('success', `✅ Model ready in ${initResult.loadTime.toFixed(0)}ms`, initResult.loadTime);
       addLog('info', `📊 Model: ${info.name} (${info.parameters.toLocaleString()} params)`);
       addLog('info', `📊 Output: ${info.outputFormat}`);
       addLog('info', `📊 Model size: ${info.size}`);
-      
+      addLog('info', `📦 Source: ${(info as any).modelSource || 'huggingface'}`);
+      addLog(
+        (info as any).realModelReady ? 'success' : 'warning',
+        (info as any).realModelReady
+          ? '🧠 PyTorch submodules loaded — real Inflect v2 inference active'
+          : '⚠️ Real model not loaded — using fallback simplified synth'
+      );
+
     } catch (error) {
       addLog('error', `❌ Failed to load model: ${error}`);
+    } finally {
+      try { progressSubscription?.remove(); } catch (_) { /* ignore */ }
     }
   }, [addLog, updateMetrics]);
 

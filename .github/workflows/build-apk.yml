@@ -1,7 +1,13 @@
 name: Build APK
 
-# Auto-release GitHub Actions workflow for InflectTTS Android App
-# Builds the React Native Android app and publishes to GitHub Releases
+# Auto-release GitHub Actions workflow for InflectTTS Android App.
+# Builds the React Native Android app and publishes to GitHub Releases.
+#
+# The HuggingFace model repository is pinned as a git submodule at
+# `models/Inflect-Nano-v2-TorchScript/` (see `.gitmodules`). At runtime,
+# the app downloads the actual LFS-backed `.pt` weights from HF on
+# first launch — they are NOT bundled into the APK. CI therefore does
+# NOT need git-lfs; only the submodule's pointer files are fetched.
 
 on:
   push:
@@ -16,8 +22,13 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout (with submodules)
         uses: actions/checkout@v4
+        with:
+          # Initialize the HF submodule. We don't need LFS because
+          # the app downloads the real .pt files at runtime — only
+          # the pointer + README files are useful in CI for documentation.
+          submodules: recursive
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -88,8 +99,11 @@ jobs:
       - name: Build debug APK
         id: buildDebug
         working-directory: android
-        continue-on-error: true
-        run: ./gradlew assembleDebug --no-daemon 2>&1 | tee build.log
+        # NOTE: continue-on-error was removed in v2.0 — silently swallowing
+        # gradle failures caused the previous "Stage APK" step to abort with
+        # a confusing "No APK found" error. If the build fails, we want to
+        # see it fail loudly.
+        run: ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
 
       - name: Upload build log
         if: always()
@@ -100,51 +114,53 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Find APK
-        id: find-apk
+      - name: Locate APK
+        id: locateApk
         run: |
-          # Check various possible APK locations
-          echo "Checking for APKs..."
-          
-          # Check standard locations
-          APK=$(find android -name "*.apk" -type f 2>/dev/null | head -5)
-          echo "Found APKs:"
-          echo "$APK"
-          
+          set -euo pipefail
+          echo "Searching for built APKs..."
+          # Preferred location: outputs/apk/debug/app-debug.apk
+          APK=""
+          for candidate in \
+              "android/app/build/outputs/apk/debug/app-debug.apk" \
+              "android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk" \
+              "android/app/build/outputs/apk/debug/app-armeabi-v7a-debug.apk"; do
+            if [ -f "$candidate" ]; then
+              APK="$candidate"
+              break
+            fi
+          done
+          # Fallback: any apk under outputs
           if [ -z "$APK" ]; then
-            echo "::warning::No APK found"
+            APK=$(find android/app/build/outputs -name "*.apk" -type f 2>/dev/null | head -1 || true)
           fi
-          
-          # List build directory
-          ls -la android/app/build/outputs/apk/ 2>/dev/null || echo "outputs/apk not found"
-          ls -la android/app/build/outputs/ 2>/dev/null || echo "outputs not found"
+          echo "Located APK: ${APK:-<none>}"
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced by the gradle build"
+            ls -la android/app/build/outputs/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
 
-      - name: Upload APK
-        if: always()
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-apk
-          path: |
-            android/app/build/outputs/**/*.apk
-            android/app/build/intermediates/apk/**/*.apk
-          if-no-files-found: warn
+          path: ${{ steps.locateApk.outputs.apk_path }}
+          if-no-files-found: error
           retention-days: 30
           compression-level: 0
 
       - name: Stage APK for release
-        if: success()
+        id: stageApk
         run: |
-          # Find any APK
-          APK=$(find android -name "*.apk" -type f 2>/dev/null | head -1)
-          
-          if [ -z "$APK" ]; then
-            echo "::error::No APK found to publish"
-            exit 1
-          fi
-          
-          echo "Found APK: $APK"
+          set -euo pipefail
+          APK="${{ steps.locateApk.outputs.apk_path }}"
+          echo "Staging APK: $APK"
           cp "$APK" InflectTTS-latest.apk
           ls -lh InflectTTS-latest.apk
+          echo "apk_name=InflectTTS-latest.apk" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -158,24 +174,33 @@ jobs:
 
             Auto-published from the most recent push to `main`.
 
-            This APK contains the Inflect Nano v2 TTS model demonstration app with:
-            - Real-time inference timing and logs
-            - Configurable speed and variation controls
-            - Sample texts for testing
-            - Native Android audio playback
+            ### What's inside
+            - React Native 0.86 + Hermes + New Architecture
+            - PyTorch Android 2.6 for on-device TorchScript inference
+            - HuggingFace submodule `nikitastaf1996/Inflect-Nano-v2-TorchScript`
+              pinned at `models/Inflect-Nano-v2-TorchScript/` (source reference)
+            - **First-run model download**: the app fetches the five scripted
+              submodule `.pt` files (`inflect_enc_p`, `inflect_dec`,
+              `inflect_enc_q`, `inflect_flow`, `inflect_dp`, total ~20 MB)
+              from HuggingFace on first launch and caches them in app-internal
+              storage. Subsequent launches reuse the cached files.
+            - Real VITS-style inference reconstruction (enc_p → dp → flow → dec)
+              with automatic fallback to a simplified synth if the real path
+              fails.
 
             ### Model Info
             - **Model:** Inflect-Nano-v2
             - **Parameters:** 3,966,721
-            - **Size:** ~16 MB
+            - **Size:** ~16 MB (scripted submodules ~20 MB on disk)
             - **Output:** 24 kHz mono WAV
+            - **Source:** `huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript`
 
             ### Build Info
             - **Commit:** [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
             - **Pushed:** ${{ github.event.head_commit.timestamp }}
             - **Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            This release is overwritten on every push.
+            This release is overwritten on every push to `main`.
           files: |
             InflectTTS-latest.apk
         env:

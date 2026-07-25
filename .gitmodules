@@ -1,0 +1,3 @@
+[submodule "models/Inflect-Nano-v2-TorchScript"]
+	path = models/Inflect-Nano-v2-TorchScript
+	url = https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript

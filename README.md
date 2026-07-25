@@ -65,9 +65,13 @@ The TTS synthesis consists of these steps:
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/YOUR_USERNAME/InflectTTS.git
+# Clone the repository with submodules (HF model repo is pinned as
+# a git submodule at models/Inflect-Nano-v2-TorchScript/).
+git clone --recurse-submodules https://github.com/nikitastaf1996/InflectTTS.git
 cd InflectTTS
+
+# If you forgot --recurse-submodules:
+git submodule update --init --recursive
 
 # Install dependencies
 npm install
@@ -78,6 +82,20 @@ npm run bundle:android
 # Build debug APK
 npm run build:apk
 ```
+
+### First-run model download
+
+The five scripted submodule `.pt` files (`inflect_enc_p`, `inflect_dec`,
+`inflect_enc_q`, `inflect_flow`, `inflect_dp`, total ~20 MB) are **not
+bundled** in the APK. On first launch, the app fetches them directly from
+HuggingFace (`huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript`)
+and caches them in the app's internal storage. Subsequent launches reuse
+the cache.
+
+To force a re-download, call the exposed `redownloadModel()` method on
+the native `InflectTTS` module.
+
+
 
 ### Running
 
@@ -100,45 +118,77 @@ adb install android/app/build/outputs/apk/debug/app-debug.apk
 InflectTTS/
 ├── .github/
 │   └── workflows/
-│       └── build-apk.yml    # GitHub Actions for auto-build
+│       └── build-apk.yml    # GitHub Actions: build APK + auto-release
 ├── android/
 │   └── app/src/main/
 │       ├── java/com/inflecttts/
 │       │   └── tts/
-│       │       ├── TTSModule.kt    # Native TTS inference module
-│       │       └── TTSPackage.kt   # React Native package
+│       │       ├── TTSModule.kt        # RN native module (orchestration + fallback synth)
+│       │       ├── ModelDownloader.kt  # Pulls .pt submodules from HuggingFace on first run
+│       │       ├── InflectInference.kt # Loads .pt files, reconstructs SynthesizerTrn.infer()
+│       │       └── TTSPackage.kt       # React Native package
 │       └── assets/
 │           └── index.android.bundle
+├── models/
+│   └── Inflect-Nano-v2-TorchScript/   # Git submodule → HF repo (pointer files only)
 ├── scripts/
-│   └── export_onnx.py       # Model export script
+│   └── export_onnx.py                  # Legacy ONNX export script (unused by v2.0 runtime)
 ├── src/
-│   └── TTSBridge.ts         # TypeScript bridge to native module
-├── App.tsx                  # Main React Native component
+│   └── TTSBridge.ts                    # TypeScript bridge to native module
+├── App.tsx                             # Main React Native component
 ├── package.json
 └── README.md
 ```
 
 ## 🔧 Development
 
-### Adding the ONNX Model
+### v2.0 submodule pathway
 
-To add the actual ONNX model for inference:
+The app uses the **scripted submodule** pathway described in the
+[HF README](https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript):
 
-1. Export the model:
-```bash
-pip install torch onnx huggingface_hub
-python scripts/export_onnx.py --model nano --download --output ./android/app/src/main/assets/
-```
+1. **Build time** — `models/Inflect-Nano-v2-TorchScript/` is a git
+   submodule pointing at the HF repo. It contains LFS pointer files
+   (132 bytes each) plus the README and Python scripts for reference.
+   CI initializes the submodule via `actions/checkout@v4` with
+   `submodules: recursive` — git-lfs is NOT required.
 
-2. Update `TTSModule.kt` to load the ONNX model using ONNX Runtime.
+2. **Runtime (first launch)** — `ModelDownloader.kt` fetches the
+   actual LFS-backed `.pt` binaries from
+   `https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript/resolve/main/<file>`
+   and writes them to `context.filesDir/inflect_model/`. Total: ~20 MB.
+
+3. **Runtime (subsequent launches)** — cached files are reused; no
+   network access is needed.
+
+4. **Inference** — `InflectInference.kt` loads each `.pt` as a
+   `org.pytorch.Module` and runs the VITS-style pipeline:
+   `enc_p → dp → flow → dec`. If anything fails, `TTSModule.synthesize()`
+   falls back to the legacy simplified synthesizer so the app remains
+   usable.
 
 ### Native Module
 
 The `TTSModule.kt` provides:
 
-- `initializeModel()` - Load the TTS model
-- `synthesize(text, speed, variation, seed)` - Run inference
-- `getModelInfo()` - Get model metadata
+- `initializeModel()` — download `.pt` submodules from HF (first run only),
+  load them via PyTorch Android, initialize the audio engine. Emits
+  `InflectTTS_ModelProgress` events during download.
+- `synthesize(text, speed, variation, seed)` — real model inference
+  with automatic fallback to simplified synth.
+- `redownloadModel()` — clear the cache and re-download the submodules.
+- `getModelInfo()` — model metadata + `realModelReady` flag + `engine` field.
+
+### Legacy ONNX export (optional)
+
+The repo still ships `scripts/export_onnx.py` for users who prefer the
+ONNX Runtime pathway. It is **not** used by the v2.0 runtime — the app
+loads `.pt` files via PyTorch Android instead.
+
+```bash
+pip install torch onnx huggingface_hub
+python scripts/export_onnx.py --model nano --download --output ./android/app/src/main/assets/
+```
 
 ## 📈 Performance
 

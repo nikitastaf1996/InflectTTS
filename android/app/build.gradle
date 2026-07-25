@@ -82,8 +82,8 @@ android {
         applicationId "com.inflecttts"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "2.0"
     }
     signingConfigs {
         debug {
@@ -105,6 +105,18 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+        pickFirst '**/libc++_shared.so'
+        pickFirst '**/libfbjni.so'
+        pickFirst '**/libjsi.so'
+        pickFirst '**/libreactnativejni.so'
+        exclude 'META-INF/DEPENDENCIES'
+        exclude 'META-INF/INDEX.LIST'
+        exclude 'META-INF/io.netty.versions.properties'
+    }
 }
 
 dependencies {
@@ -116,4 +128,14 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // PyTorch Android for on-device TorchScript model inference.
+    // We use the full (non-lite) variant because the HuggingFace
+    // submodule repo ships `.pt` files produced by `torch.jit.script().save()`,
+    // which are not lite-interpreter `.ptl` files. The full runtime can
+    // load both; the lite runtime can only load `.ptl`.
+    // The five scripted submodule .pt files are pulled from HuggingFace
+    // on first run (see ModelDownloader.kt) and reconstructed locally.
+    implementation 'org.pytorch:pytorch_android:2.6.0'
+    implementation 'org.pytorch:pytorch_android_torchvision:2.6.0'
 }
