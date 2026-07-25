@@ -84,6 +84,26 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
     @Volatile
     private var loadFailureStacktrace: String? = null
 
+    /**
+     * Last inference (synthesize) failure reason, captured so the user
+     * can see WHY synthesis failed even if the app crashes immediately
+     * after. Cleared at the start of each successful synthesis.
+     */
+    @Volatile
+    private var lastInferenceError: String? = null
+
+    /** Full stack trace of the last inference failure. */
+    @Volatile
+    private var lastInferenceErrorStacktrace: String? = null
+
+    /** Total number of synthesis attempts (success + failure). */
+    @Volatile
+    private var inferenceAttempts: Int = 0
+
+    /** Total number of successful syntheses. */
+    @Volatile
+    private var inferenceSuccesses: Int = 0
+
     /** Pulls the five `.pt` files from HuggingFace on first run. */
     private val modelDownloader = ModelDownloader(reactContext)
 
@@ -406,6 +426,7 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
         scope.launch {
             val results = Arguments.createArray()
             val timings = Arguments.createMap()
+            inferenceAttempts += 1  // track attempts for diagnostics
 
             try {
                 val totalStart = System.nanoTime()
@@ -438,13 +459,20 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         noiseScaleW = variation.toFloat(),
                     )
                 } catch (t: Throwable) {
-                    // Use the shared helper so the cause-chain format is
-                    // consistent with the load-failure path.
+                    // Capture the failure into the @Volatile fields BEFORE
+                    // re-throwing, so that even if the re-throw itself
+                    // somehow crashes the process, getDiagnostics() will
+                    // still report the inference failure on next launch.
                     val reason = buildFailureReason(t)
                     val fullMsg = "Inference failed: $reason"
+                    lastInferenceError = fullMsg
+                    lastInferenceErrorStacktrace = stackTraceToString(t)
                     Log.e(TAG, fullMsg, t)
                     throw RuntimeException(fullMsg, t)
                 }
+                // Inference succeeded — clear any previous inference error.
+                lastInferenceError = null
+                lastInferenceErrorStacktrace = null
                 val synthTime = (System.nanoTime() - synthStart) / 1_000_000.0
                 timings.putDouble("waveformSynthesis", synthTime)
 
@@ -456,6 +484,7 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 timings.putDouble("postProcessing", postTime)
 
                 val totalTime = (System.nanoTime() - totalStart) / 1_000_000.0
+                inferenceSuccesses += 1
 
                 results.pushMap(Arguments.createMap().apply {
                     putString("step", "preprocessing"); putDouble("time", preprocessTime)
@@ -546,6 +575,14 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 result.putString("loadFailureReason", if (loadFailureReason.isEmpty()) null else loadFailureReason)
                 result.putString("loadFailureStacktrace", loadFailureStacktrace)
                 result.putDouble("loadTime", modelLoadTime.toDouble())
+
+                // ---- Inference stats (useful when debugging synthesize()
+                // failures or app crashes during synthesis) ----
+                result.putInt("inferenceAttempts", inferenceAttempts)
+                result.putInt("inferenceSuccesses", inferenceSuccesses)
+                result.putInt("inferenceFailures", inferenceAttempts - inferenceSuccesses)
+                result.putString("lastInferenceError", lastInferenceError)
+                result.putString("lastInferenceErrorStacktrace", lastInferenceErrorStacktrace)
 
                 // File-level diagnostics
                 val dir = File(reactApplicationContext.filesDir, ModelDownloader.MODEL_DIR_NAME)

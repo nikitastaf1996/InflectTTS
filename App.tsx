@@ -257,6 +257,26 @@ const App: React.FC = () => {
       lines.push(`modelDir: ${diag.modelDir}`);
       lines.push(`modelDirExists: ${diag.modelDirExists}`);
       lines.push('');
+      lines.push('--- Inference Stats ---');
+      lines.push(`inferenceAttempts: ${diag.inferenceAttempts ?? 0}`);
+      lines.push(`inferenceSuccesses: ${diag.inferenceSuccesses ?? 0}`);
+      lines.push(`inferenceFailures: ${diag.inferenceFailures ?? 0}`);
+      if (diag.lastInferenceError) {
+        lines.push(`lastInferenceError:`);
+        diag.lastInferenceError.split('\n').forEach((l: string) => lines.push(`  ${l}`));
+      } else {
+        lines.push('lastInferenceError: (none — no inference attempted yet, or last inference succeeded)');
+      }
+      if (diag.lastInferenceErrorStacktrace) {
+        lines.push('');
+        lines.push('lastInferenceErrorStacktrace (first 15 lines):');
+        diag.lastInferenceErrorStacktrace.split('\n').slice(0, 15).forEach((l: string) => lines.push(`  ${l}`));
+        const totalLines2 = diag.lastInferenceErrorStacktrace.split('\n').length;
+        if (totalLines2 > 15) {
+          lines.push(`  ... (${totalLines2 - 15} more lines — full trace in logcat)`);
+        }
+      }
+      lines.push('');
       lines.push('--- Load Failure ---');
       if (diag.loadFailureReason) {
         lines.push(`loadFailureReason:`);
