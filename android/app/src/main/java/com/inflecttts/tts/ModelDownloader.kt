@@ -94,8 +94,16 @@ class ModelDownloader(private val context: Context) {
     val modelDir: File
         get() = File(context.filesDir, MODEL_DIR_NAME).apply { if (!exists()) mkdirs() }
 
-    /** True iff every expected .pt file already exists on disk. */
-    fun allPresent(): Boolean = MODEL_FILES.all { File(modelDir, it.name).exists() }
+    /**
+     * True iff every expected `.pt` file exists on disk AND its size
+     * matches the expected size. A partial download (file exists but
+     * is too small) returns false here, so [ensureModels] will re-fetch
+     * the corrupted/truncated file instead of trying to load it.
+     */
+    fun allPresent(): Boolean = MODEL_FILES.all { mf ->
+        val f = File(modelDir, mf.name)
+        f.exists() && f.length() == mf.expectedSize
+    }
 
     /**
      * Ensure every submodule .pt file exists locally. Files already present
@@ -116,6 +124,12 @@ class ModelDownloader(private val context: Context) {
             if (target.exists() && target.length() == model.expectedSize) {
                 Log.d(TAG, "Already cached: ${model.name} (${target.length()} bytes)")
                 return@forEachIndexed
+            }
+            if (target.exists() && target.length() != model.expectedSize) {
+                Log.w(TAG, "${model.name}: partial/corrupt file on disk " +
+                    "(got ${target.length()}, expected ${model.expectedSize}) — re-downloading")
+            } else if (!target.exists()) {
+                Log.i(TAG, "${model.name}: not on disk — downloading")
             }
 
             onProgress(Progress.Started(index, total, model))

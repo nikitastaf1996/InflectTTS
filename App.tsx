@@ -197,27 +197,86 @@ const App: React.FC = () => {
       if ((info as any).realModelReady) {
         addLog('success', '🧠 PyTorch submodules loaded — real Inflect v2 inference active');
       } else {
-        // No fallback in v2.1. Surface the exact reason the model didn't
-        // load so the user can debug (network, corrupted file, TorchScript
-        // incompat, OOM, missing permission, …).
-        const reason = (info as any).loadFailureReason || 'unknown reason';
-        addLog('error', `❌ Model failed to load. Synthesis will not work.`);
+        // No fallback. Surface the exact reason and stack trace so the
+        // user can debug without needing logcat access.
+        const reason = (info as any).loadFailureReason
+          || 'No failure reason captured — this is a bug. Call getDiagnostics() and check logcat.';
+        const stack: string | undefined = (info as any).loadFailureStacktrace;
+        addLog('error', `❌ Model failed to load. Synthesis is disabled.`);
         addLog('error', `   Reason: ${reason}`);
-        addLog('info', `   Tip: call redownloadModel() to retry, or check logcat for the full stack trace.`);
+        if (stack) {
+          // Log the first ~10 lines of the stack trace so they're visible
+          // in the scrollable log panel without overwhelming it.
+          const stackLines = stack.split('\n').slice(0, 12);
+          addLog('error', `   Stack trace (first ${stackLines.length} lines):`);
+          stackLines.forEach((line: string) => addLog('error', `     ${line}`));
+          if (stack.split('\n').length > 12) {
+            addLog('info', `     … (${stack.split('\n').length - 12} more lines — see logcat for full trace)`);
+          }
+        }
+        addLog('info', `   Tip: call getDiagnostics() for file-level details, or redownloadModel() to retry.`);
         Alert.alert(
           'Model load failed',
           `The Inflect v2 model could not be loaded:\n\n${reason}\n\n` +
-          `Synthesis is disabled until this is fixed. Try "Redownload model" ` +
-          `or check the log panel for details.`,
+          (stack ? `Stack trace (first 5 lines):\n${stack.split('\n').slice(0, 5).join('\n')}\n\n` : '') +
+          `Synthesis is disabled. Tap "Get Diagnostics" in the log panel for file-level details, ` +
+          `or "Redownload model" to retry.`,
         );
       }
 
-    } catch (error) {
-      addLog('error', `❌ Failed to load model: ${error}`);
+    } catch (error: any) {
+      const code = error?.code || 'UNKNOWN';
+      const msg = error?.message || String(error);
+      addLog('error', `❌ Failed to load model [${code}]: ${msg}`);
     } finally {
       try { progressSubscription?.remove(); } catch (_) { /* ignore */ }
     }
   }, [addLog, updateMetrics]);
+
+  // Run native getDiagnostics() and dump the result to the log panel.
+  // Useful when the model fails to load — shows per-file sizes, which
+  // modules loaded, and whether the PyTorch native lib is available.
+  const runDiagnostics = useCallback(async () => {
+    const { InflectTTS } = (await import('react-native')).NativeModules;
+    if (!InflectTTS || !InflectTTS.getDiagnostics) {
+      addLog('error', '❌ getDiagnostics() not available on this platform');
+      return;
+    }
+    addLog('info', '🔎 Running diagnostics…');
+    try {
+      const diag: any = await InflectTTS.getDiagnostics();
+      addLog('info', `   isInitialized: ${diag.isInitialized}`);
+      addLog('info', `   realModelReady: ${diag.realModelReady}`);
+      addLog('info', `   modelDir: ${diag.modelDir}`);
+      addLog('info', `   modelDirExists: ${diag.modelDirExists}`);
+      if (diag.loadFailureReason) {
+        addLog('error', `   loadFailureReason: ${diag.loadFailureReason}`);
+      }
+      if (diag.files && Array.isArray(diag.files)) {
+        addLog('info', `   Files:`);
+        diag.files.forEach((f: any) => {
+          const sizeOk = f.sizeMatches ? '✓' : '✗';
+          const actualKB = f.actualSize >= 0 ? `${(f.actualSize / 1024).toFixed(0)} KB` : 'MISSING';
+          const expectedKB = `${(f.expectedSize / 1024).toFixed(0)} KB`;
+          addLog(f.sizeMatches ? 'info' : 'error',
+            `     ${sizeOk} ${f.name}: ${actualKB} / ${expectedKB}`);
+        });
+      }
+      if (diag.pytorchProbe) {
+        addLog('info', `   PyTorch probe:`);
+        addLog('info', `     classLoaded: ${diag.pytorchProbe.classLoaded}`);
+        addLog('info', `     nativeLibStatus: ${diag.pytorchProbe.nativeLibStatus}`);
+      }
+      if (diag.inference) {
+        addLog('info', `   Inference modules loaded:`);
+        const m = diag.inference.modulesLoaded || {};
+        addLog('info', `     encP=${m.encP} dec=${m.dec} encQ=${m.encQ} flow=${m.flow} dp=${m.dp}`);
+      }
+      addLog('success', '✅ Diagnostics complete — see logcat for full details');
+    } catch (error: any) {
+      addLog('error', `❌ Diagnostics failed: ${error?.message || error}`);
+    }
+  }, [addLog]);
 
   // Run TTS inference
   const runInference = useCallback(async () => {
@@ -512,6 +571,37 @@ const App: React.FC = () => {
             </Text>
           )}
         </TouchableOpacity>
+
+        {/* Diagnostics + Redownload row — shown when the model
+            failed to load, so the user can debug without logcat. */}
+        <View style={styles.diagnosticsRow}>
+          <TouchableOpacity
+            style={styles.diagnosticsButton}
+            onPress={runDiagnostics}
+          >
+            <Text style={styles.diagnosticsButtonText}>🔎 Get Diagnostics</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.diagnosticsButton}
+            onPress={async () => {
+              const { InflectTTS } = require('react-native').NativeModules;
+              if (InflectTTS?.redownloadModel) {
+                addLog('info', '🔄 Re-downloading model…');
+                try {
+                  await InflectTTS.redownloadModel();
+                  addLog('success', '✅ Re-download complete. Re-initializing…');
+                  setModelInfo(null);
+                  setIsModelLoaded(false);
+                  loadModel();
+                } catch (e: any) {
+                  addLog('error', `❌ Re-download failed: ${e?.message || e}`);
+                }
+              }
+            }}
+          >
+            <Text style={styles.diagnosticsButtonText}>🔄 Redownload Model</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Logs Section */}
@@ -717,6 +807,26 @@ const styles = StyleSheet.create({
     color: '#000',
     fontSize: 18,
     fontWeight: 'bold',
+  },
+  diagnosticsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 8,
+    gap: 8,
+  },
+  diagnosticsButton: {
+    flex: 1,
+    backgroundColor: '#2a2a2a',
+    borderColor: '#00d9ff',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    alignItems: 'center',
+  },
+  diagnosticsButtonText: {
+    color: '#00d9ff',
+    fontSize: 13,
+    fontWeight: '600',
   },
   loadingContainer: {
     flexDirection: 'row',

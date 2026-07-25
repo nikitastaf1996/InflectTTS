@@ -53,15 +53,36 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
     private var isInitialized = false
     private var modelLoadTime: Long = 0
 
-    /** True when the real PyTorch submodules have been loaded successfully. */
+    /**
+     * True when the real PyTorch submodules have been loaded successfully.
+     * `@Volatile` because it's written on a background coroutine thread (inside
+     * `initializeModel()`'s `scope.launch`) and read on the JS thread (when
+     * `synthesize()` is called from a ReactMethod).
+     */
+    @Volatile
     private var realModelReady = false
 
     /**
-     * Human-readable reason why the real PyTorch submodules failed to load
-     * (null on success or before [initializeModel] runs). Surfaced to JS via
-     * `getModelInfo()` so the UI can show exactly what went wrong.
+     * Human-readable reason why the real PyTorch submodules failed to load.
+     *
+     * `@Volatile` for the same cross-thread reason as [realModelReady] —
+     * without it, the JS thread can see `realModelReady = false` (volatile
+     * read) but a stale `null` value for `loadFailureReason` (non-volatile
+     * read), which previously produced the useless "unknown reason" message.
+     *
+     * Initialized to a non-null default so we never have a null-with-false
+     * state again. Set to null only on successful load.
      */
-    private var loadFailureReason: String? = null
+    @Volatile
+    private var loadFailureReason: String = "Model has not been initialized yet. Call initializeModel() first."
+
+    /**
+     * Full stack trace of the last load failure (as a string), captured so
+     * the JS side can display it without needing logcat access. Null on
+     * success or before initialization.
+     */
+    @Volatile
+    private var loadFailureStacktrace: String? = null
 
     /** Pulls the five `.pt` files from HuggingFace on first run. */
     private val modelDownloader = ModelDownloader(reactContext)
@@ -178,12 +199,17 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                     realModelReady = inference.isReady()
                     if (!realModelReady) {
                         // Defensive — load() should throw rather than leave
-                        // the modules unloaded, but guard anyway.
-                        loadFailureReason = "inference.load() returned but isReady()=false (unknown reason)"
+                        // the modules unloaded, but guard anyway. Capture
+                        // as much context as possible.
+                        val diag = inference.getDiagnostics()
+                        loadFailureReason = "inference.load() returned without throwing, but isReady()=false. " +
+                            "Diagnostics: $diag"
+                        loadFailureStacktrace = null
                         Log.e(TAG, loadFailureReason!!)
                         emitProgress("model_load_failed", loadFailureReason!!, 1.0f)
                     } else {
-                        loadFailureReason = null
+                        loadFailureReason = ""
+                        loadFailureStacktrace = null
                         Log.i(TAG, "InflectInference loaded in ${System.currentTimeMillis() - loadStart} ms")
                         emitProgress("model_loaded", "PyTorch submodules loaded", 1.0f)
                     }
@@ -191,19 +217,8 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                     // Build a detailed reason: short class name + message +
                     // the first cause in the chain (typically the real culprit
                     // for TorchScript load failures).
-                    val sb = StringBuilder()
-                    sb.append(t.javaClass.simpleName)
-                    if (!t.message.isNullOrBlank()) sb.append(": ").append(t.message)
-                    var cause: Throwable? = t.cause
-                    var depth = 0
-                    while (cause != null && depth < 3) {
-                        sb.append(" | caused by ")
-                            .append(cause.javaClass.simpleName)
-                        if (!cause.message.isNullOrBlank()) sb.append(": ").append(cause.message)
-                        cause = cause.cause
-                        depth++
-                    }
-                    loadFailureReason = sb.toString()
+                    loadFailureReason = buildFailureReason(t)
+                    loadFailureStacktrace = stackTraceToString(t)
                     realModelReady = false
                     Log.e(TAG, "Submodule load failed: $loadFailureReason", t)
                     emitProgress("model_load_failed", loadFailureReason!!, 1.0f)
@@ -250,7 +265,8 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         putBoolean("realModelReady", realModelReady)
                         putString("modelSource", "huggingface:${ModelDownloader.HF_REPO}")
                         putString("engine", if (realModelReady) "pytorch_submodules" else "none")
-                        putString("loadFailureReason", loadFailureReason)
+                        putString("loadFailureReason", if (loadFailureReason.isEmpty()) null else loadFailureReason)
+                        putString("loadFailureStacktrace", loadFailureStacktrace)
                     })
                 }
 
@@ -258,9 +274,10 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
 
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize model", e)
-                loadFailureReason = "${e.javaClass.simpleName}: ${e.message}"
+                loadFailureReason = buildFailureReason(e)
+                loadFailureStacktrace = stackTraceToString(e)
                 withContext(Dispatchers.Main) {
-                    promise.reject("INIT_ERROR", e.message, e)
+                    promise.reject("INIT_ERROR", loadFailureReason, e)
                 }
             }
         }
@@ -324,12 +341,38 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
             return
         }
         if (!realModelReady) {
-            val reason = loadFailureReason ?: "unknown reason"
-            val msg = "Model is not loaded. Reason: $reason. " +
-                "Call redownloadModel() to retry, or check logcat for details."
-            Log.e(TAG, "synthesize() rejected: $msg")
-            // promise.reject is safe to call from any thread; no need to
-            // hop to the main thread for a rejection.
+            // loadFailureReason is @Volatile and initialized to a non-null
+            // default, so it's never null here. If it's blank, fall back to
+            // a message that tells the user to call getDiagnostics() and
+            // check logcat — never the useless "unknown reason" again.
+            val reason = loadFailureReason.ifBlank {
+                "Model load completed but realModelReady is false, and no " +
+                    "failure reason was captured. This indicates a crash " +
+                    "during native module initialization (likely " +
+                    "UnsatisfiedLinkError or NoClassDefFoundError in the " +
+                    "PyTorch native runtime). Call getDiagnostics() for " +
+                    "file-level details, and run " +
+                    "'adb logcat -s InflectTTS:* InflectInference:* " +
+                    "AndroidRuntime:*' to capture the native crash."
+            }
+            val stack = loadFailureStacktrace
+            val msg = buildString {
+                append("Model is not loaded.\n\n")
+                append("Reason: $reason\n")
+                if (!stack.isNullOrBlank()) {
+                    append("\nStack trace:\n")
+                    // Truncate very long stack traces so the JS Alert
+                    // doesn't choke on them.
+                    val maxStack = 4000
+                    append(stack.take(maxStack))
+                    if (stack.length > maxStack) {
+                        append("\n... (${stack.length - maxStack} more chars truncated; see logcat for full trace)")
+                    }
+                }
+                append("\n\nTo retry: call redownloadModel() from JS, ")
+                append("or call getDiagnostics() for file-level details.")
+            }
+            Log.e(TAG, "synthesize() rejected: $reason", RuntimeException("MODEL_NOT_LOADED"))
             promise.reject("MODEL_NOT_LOADED", msg)
             return
         }
@@ -369,23 +412,12 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         noiseScaleW = variation.toFloat(),
                     )
                 } catch (t: Throwable) {
-                    // Walk the cause chain to give the user a single
-                    // readable string instead of just the top-level message.
-                    val sb = StringBuilder()
-                    sb.append("Inference failed: ")
-                        .append(t.javaClass.simpleName)
-                    if (!t.message.isNullOrBlank()) sb.append(": ").append(t.message)
-                    var cause: Throwable? = t.cause
-                    var depth = 0
-                    while (cause != null && depth < 3) {
-                        sb.append(" | caused by ")
-                            .append(cause.javaClass.simpleName)
-                        if (!cause.message.isNullOrBlank()) sb.append(": ").append(cause.message)
-                        cause = cause.cause
-                        depth++
-                    }
-                    Log.e(TAG, sb.toString(), t)
-                    throw RuntimeException(sb.toString(), t)
+                    // Use the shared helper so the cause-chain format is
+                    // consistent with the load-failure path.
+                    val reason = buildFailureReason(t)
+                    val fullMsg = "Inference failed: $reason"
+                    Log.e(TAG, fullMsg, t)
+                    throw RuntimeException(fullMsg, t)
                 }
                 val synthTime = (System.nanoTime() - synthStart) / 1_000_000.0
                 timings.putDouble("waveformSynthesis", synthTime)
@@ -460,9 +492,130 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
             putBoolean("realModelReady", realModelReady)
             putString("modelSource", "huggingface:${ModelDownloader.HF_REPO}")
             putString("engine", if (realModelReady) "pytorch_submodules" else "none")
-            putString("loadFailureReason", loadFailureReason)
+            putString("loadFailureReason", if (loadFailureReason.isEmpty()) null else loadFailureReason)
+            putString("loadFailureStacktrace", loadFailureStacktrace)
             putDouble("loadTime", modelLoadTime.toDouble())
         })
+    }
+
+    /**
+     * Return detailed diagnostics about the on-device model state.
+     *
+     * Useful for debugging "model not loaded" errors without needing
+     * logcat access. Returns:
+     *   - isInitialized, realModelReady flags
+     *   - loadFailureReason (string) + loadFailureStacktrace (string)
+     *   - modelDir path + whether it exists
+     *   - per-file status: name, exists, expectedSize, actualSize, matches
+     *   - PyTorch native lib load status (best-effort: try to touch the
+     *     Module class and report whether it loaded)
+     */
+    @ReactMethod
+    fun getDiagnostics(promise: Promise) {
+        scope.launch {
+            val result = Arguments.createMap()
+            try {
+                result.putBoolean("isInitialized", isInitialized)
+                result.putBoolean("realModelReady", realModelReady)
+                result.putString("loadFailureReason", if (loadFailureReason.isEmpty()) null else loadFailureReason)
+                result.putString("loadFailureStacktrace", loadFailureStacktrace)
+                result.putDouble("loadTime", modelLoadTime.toDouble())
+
+                // File-level diagnostics
+                val dir = File(reactApplicationContext.filesDir, ModelDownloader.MODEL_DIR_NAME)
+                result.putString("modelDir", dir.absolutePath)
+                result.putBoolean("modelDirExists", dir.exists())
+
+                val filesArr = Arguments.createArray()
+                for (mf in ModelDownloader.MODEL_FILES) {
+                    val f = File(dir, mf.name)
+                    val actualSize = if (f.exists()) f.length() else -1L
+                    filesArr.pushMap(Arguments.createMap().apply {
+                        putString("name", mf.name)
+                        putBoolean("exists", f.exists())
+                        putDouble("expectedSize", mf.expectedSize.toDouble())
+                        putDouble("actualSize", actualSize.toDouble())
+                        putBoolean("sizeMatches", actualSize == mf.expectedSize)
+                    })
+                }
+                result.putArray("files", filesArr)
+
+                // Best-effort PyTorch native-lib probe: touch the Module class
+                // and report whether it's loaded. UnsatisfiedLinkError here
+                // would mean PyTorch's native libs don't support this device.
+                val pytorchProbe = Arguments.createMap()
+                try {
+                    val cls = Class.forName("org.pytorch.Module")
+                    pytorchProbe.putBoolean("classLoaded", true)
+                    pytorchProbe.putString("classLoader", cls.classLoader?.toString() ?: "null")
+                    // Try to access a static method to force native-lib load.
+                    // Module.moduleInitProgressListener() is a no-op static
+                    // that exists in 2.1.0; if it throws UnsatisfiedLinkError,
+                    // the native lib failed to load.
+                    try {
+                        cls.getDeclaredMethod("moduleInitProgressListener")
+                        pytorchProbe.putBoolean("nativeLibProbed", true)
+                        pytorchProbe.putString("nativeLibStatus", "class loads; native lib appears OK")
+                    } catch (nsme: NoSuchMethodException) {
+                        pytorchProbe.putBoolean("nativeLibProbed", false)
+                        pytorchProbe.putString("nativeLibStatus", "class loads but probe method not found (PyTorch API may differ)")
+                    } catch (ule: UnsatisfiedLinkError) {
+                        pytorchProbe.putBoolean("nativeLibProbed", false)
+                        pytorchProbe.putString("nativeLibStatus", "UnsatisfiedLinkError: ${ule.message}")
+                    }
+                } catch (cnfe: ClassNotFoundException) {
+                    pytorchProbe.putBoolean("classLoaded", false)
+                    pytorchProbe.putString("nativeLibStatus", "org.pytorch.Module class NOT FOUND — PyTorch dependency not on classpath")
+                } catch (t: Throwable) {
+                    pytorchProbe.putBoolean("classLoaded", false)
+                    pytorchProbe.putString("nativeLibStatus", "${t.javaClass.simpleName}: ${t.message}")
+                }
+                result.putMap("pytorchProbe", pytorchProbe)
+
+                // InflectInference diagnostics
+                result.putMap("inference", inference.getDiagnosticsAsMap())
+
+                withContext(Dispatchers.Main) {
+                    promise.resolve(result)
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "getDiagnostics failed", t)
+                withContext(Dispatchers.Main) {
+                    promise.reject("DIAG_ERROR", "${t.javaClass.simpleName}: ${t.message}", t)
+                }
+            }
+        }
+    }
+
+    /**
+     * Build a human-readable failure reason from an exception, walking the
+     * cause chain (up to 3 levels deep). Format:
+     *   ClassName: message | caused by ClassName: message | ...
+     */
+    private fun buildFailureReason(t: Throwable): String {
+        val sb = StringBuilder()
+        sb.append(t.javaClass.simpleName)
+        if (!t.message.isNullOrBlank()) sb.append(": ").append(t.message)
+        var cause: Throwable? = t.cause
+        var depth = 0
+        while (cause != null && depth < 3) {
+            sb.append(" | caused by ")
+                .append(cause.javaClass.simpleName)
+            if (!cause.message.isNullOrBlank()) sb.append(": ").append(cause.message)
+            cause = cause.cause
+            depth++
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Serialize a Throwable (with its cause chain) to a full stack-trace
+     * string, suitable for display in the JS Alert / log panel.
+     */
+    private fun stackTraceToString(t: Throwable): String {
+        val sw = java.io.StringWriter()
+        t.printStackTrace(java.io.PrintWriter(sw))
+        return sw.toString()
     }
 
     /**

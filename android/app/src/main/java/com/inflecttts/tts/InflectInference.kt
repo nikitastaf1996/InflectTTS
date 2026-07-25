@@ -74,7 +74,11 @@ class InflectInference(private val context: Context) {
     fun isReady(): Boolean = isLoaded
 
     /**
-     * Load all five `.pt` submodules. Throws on any failure.
+     * Load all five `.pt` submodules. Throws on any failure with a
+     * message that identifies WHICH file failed — so the user can
+     * tell whether (e.g.) `inflect_dec.pt` is corrupted vs.
+     * `inflect_enc_p.pt` having a TorchScript incompat.
+     *
      * Call on a background thread.
      */
     fun load() {
@@ -85,19 +89,42 @@ class InflectInference(private val context: Context) {
         Log.i(TAG, "Loading scripted submodules from ${modelDir.absolutePath}")
 
         val t0 = System.currentTimeMillis()
-        encP = Module.load(File(modelDir, "inflect_enc_p.pt").absolutePath)
-        Log.d(TAG, "Loaded enc_p (${File(modelDir, "inflect_enc_p.pt").length() / 1024} KB)")
-        dec = Module.load(File(modelDir, "inflect_dec.pt").absolutePath)
-        Log.d(TAG, "Loaded dec (${File(modelDir, "inflect_dec.pt").length() / 1024} KB)")
-        encQ = Module.load(File(modelDir, "inflect_enc_q.pt").absolutePath)
-        Log.d(TAG, "Loaded enc_q (${File(modelDir, "inflect_enc_q.pt").length() / 1024} KB)")
-        flow = Module.load(File(modelDir, "inflect_flow.pt").absolutePath)
-        Log.d(TAG, "Loaded flow (${File(modelDir, "inflect_flow.pt").length() / 1024} KB)")
-        dp = Module.load(File(modelDir, "inflect_dp.pt").absolutePath)
-        Log.d(TAG, "Loaded dp (${File(modelDir, "inflect_dp.pt").length() / 1024} KB)")
+
+        // Per-module load with descriptive errors. Each Module.load() can
+        // throw RuntimeException (file not found, TorchScript parse error,
+        // unsupported op, …). We wrap each one so the stack trace shows
+        // exactly which file was being loaded when the failure happened.
+        encP = loadOne("inflect_enc_p.pt")
+        dec  = loadOne("inflect_dec.pt")
+        encQ = loadOne("inflect_enc_q.pt")
+        flow = loadOne("inflect_flow.pt")
+        dp   = loadOne("inflect_dp.pt")
 
         isLoaded = true
         Log.i(TAG, "All submodules loaded in ${System.currentTimeMillis() - t0} ms")
+    }
+
+    /**
+     * Load a single `.pt` file, wrapping any exception with the filename
+     * and file size so the failure is easy to diagnose.
+     */
+    private fun loadOne(name: String): Module {
+        val file = File(modelDir, name)
+        val sizeBytes = if (file.exists()) file.length() else -1L
+        val sizeStr = if (sizeBytes >= 0) "${sizeBytes / 1024} KB" else "MISSING"
+        Log.d(TAG, "Loading $name ($sizeStr) from ${modelDir.absolutePath}")
+        return try {
+            Module.load(file.absolutePath)
+        } catch (t: Throwable) {
+            // Re-throw with a richer message that includes the filename
+            // and on-disk size — the original exception is preserved as
+            // the cause so the full stack trace is still available.
+            val msg = "Failed to load $name " +
+                "(path=${file.absolutePath}, sizeOnDisk=$sizeStr): " +
+                "${t.javaClass.simpleName}: ${t.message}"
+            Log.e(TAG, msg, t)
+            throw RuntimeException(msg, t)
+        }
     }
 
     /** Release native module memory. */
@@ -108,6 +135,71 @@ class InflectInference(private val context: Context) {
         flow?.destroy(); flow = null
         dp?.destroy();   dp   = null
         isLoaded = false
+    }
+
+    /**
+     * Return a plain-map (Kotlin Map<String, Any?>) snapshot of the
+     * inference state for debugging. Used by [TTSModule.getDiagnostics].
+     */
+    fun getDiagnostics(): Map<String, Any?> {
+        val dir = modelDir
+        val filesStatus = ModelDownloader.MODEL_FILES.associate { mf ->
+            val f = File(dir, mf.name)
+            val actual = if (f.exists()) f.length() else -1L
+            mf.name to mapOf(
+                "exists" to f.exists(),
+                "expectedSize" to mf.expectedSize,
+                "actualSize" to actual,
+                "sizeMatches" to (actual == mf.expectedSize),
+            )
+        }
+        return mapOf(
+            "isLoaded" to isLoaded,
+            "isReady" to isReady(),
+            "modelDir" to dir.absolutePath,
+            "modelDirExists" to dir.exists(),
+            "modulesLoaded" to mapOf(
+                "encP" to (encP != null),
+                "dec"  to (dec  != null),
+                "encQ" to (encQ != null),
+                "flow" to (flow != null),
+                "dp"   to (dp   != null),
+            ),
+            "files" to filesStatus,
+        )
+    }
+
+    /**
+     * Same as [getDiagnostics] but returns a React Native WritableMap,
+     * for direct inclusion in a Promise resolve payload.
+     */
+    fun getDiagnosticsAsMap(): com.facebook.react.bridge.WritableMap {
+        val m = com.facebook.react.bridge.Arguments.createMap()
+        m.putBoolean("isLoaded", isLoaded)
+        m.putBoolean("isReady", isReady())
+        m.putString("modelDir", modelDir.absolutePath)
+        m.putBoolean("modelDirExists", modelDir.exists())
+        val modules = com.facebook.react.bridge.Arguments.createMap()
+        modules.putBoolean("encP", encP != null)
+        modules.putBoolean("dec",  dec  != null)
+        modules.putBoolean("encQ", encQ != null)
+        modules.putBoolean("flow", flow != null)
+        modules.putBoolean("dp",   dp   != null)
+        m.putMap("modulesLoaded", modules)
+        val files = com.facebook.react.bridge.Arguments.createArray()
+        for (mf in ModelDownloader.MODEL_FILES) {
+            val f = File(modelDir, mf.name)
+            val actual = if (f.exists()) f.length() else -1L
+            files.pushMap(com.facebook.react.bridge.Arguments.createMap().apply {
+                putString("name", mf.name)
+                putBoolean("exists", f.exists())
+                putDouble("expectedSize", mf.expectedSize.toDouble())
+                putDouble("actualSize", actual.toDouble())
+                putBoolean("sizeMatches", actual == mf.expectedSize)
+            })
+        }
+        m.putArray("files", files)
+        return m
     }
 
     /**
