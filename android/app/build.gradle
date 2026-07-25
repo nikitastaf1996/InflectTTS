@@ -85,6 +85,14 @@ android {
         versionCode 2
         versionName "2.0"
     }
+
+    // PyTorch Android (transitively) and React Native both ship
+    // `com.facebook.jni.*` classes. RN wins via the per-dep `exclude`
+    // below; this configurations-level rule is a belt-and-suspenders
+    // to make sure `fbjni-java-only` is dropped from any path.
+    configurations.all {
+        exclude group: 'com.facebook.fbjni', module: 'fbjni-java-only'
+    }
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -140,7 +148,15 @@ dependencies {
     // published to Maven Central; 2.1.0 is forward-compatible with
     // TorchScript files produced by newer PyTorch versions for the ops
     // used in this model.
+    //
+    // The `fbjni-java-only` transitive dep from PyTorch conflicts with
+    // React Native's `fbjni:0.7.0` (both ship `com.facebook.jni.*`
+    // classes). Excluding the java-only variant lets RN's full fbjni
+    // (with native bits) win, and PyTorch's JNI calls still resolve
+    // at runtime because fbjni-0.7.0 is API-compatible.
     // The five scripted submodule .pt files are pulled from HuggingFace
     // on first run (see ModelDownloader.kt) and reconstructed locally.
-    implementation 'org.pytorch:pytorch_android:2.1.0'
+    implementation('org.pytorch:pytorch_android:2.1.0') {
+        exclude group: 'com.facebook.fbjni', module: 'fbjni-java-only'
+    }
 }
