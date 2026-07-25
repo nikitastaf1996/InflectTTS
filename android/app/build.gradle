@@ -134,8 +134,13 @@ dependencies {
     // submodule repo ships `.pt` files produced by `torch.jit.script().save()`,
     // which are not lite-interpreter `.ptl` files. The full runtime can
     // load both; the lite runtime can only load `.ptl`.
+    //
+    // NOTE: 2.1.0 is the latest version published to Maven Central as of
+    // 2026-07. The HF README references 2.6.0 but that version was never
+    // published to Maven Central; 2.1.0 is forward-compatible with
+    // TorchScript files produced by newer PyTorch versions for the ops
+    // used in this model.
     // The five scripted submodule .pt files are pulled from HuggingFace
     // on first run (see ModelDownloader.kt) and reconstructed locally.
-    implementation 'org.pytorch:pytorch_android:2.6.0'
-    implementation 'org.pytorch:pytorch_android_torchvision:2.6.0'
+    implementation 'org.pytorch:pytorch_android:2.1.0'
 }

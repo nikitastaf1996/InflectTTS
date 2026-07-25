@@ -103,7 +103,10 @@ jobs:
         # gradle failures caused the previous "Stage APK" step to abort with
         # a confusing "No APK found" error. If the build fails, we want to
         # see it fail loudly.
-        run: ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+        # `set -o pipefail` ensures gradle's exit code propagates through `tee`.
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
 
       - name: Upload build log
         if: always()
