@@ -194,12 +194,23 @@ const App: React.FC = () => {
       addLog('info', `📊 Output: ${info.outputFormat}`);
       addLog('info', `📊 Model size: ${info.size}`);
       addLog('info', `📦 Source: ${(info as any).modelSource || 'huggingface'}`);
-      addLog(
-        (info as any).realModelReady ? 'success' : 'warning',
-        (info as any).realModelReady
-          ? '🧠 PyTorch submodules loaded — real Inflect v2 inference active'
-          : '⚠️ Real model not loaded — using fallback simplified synth'
-      );
+      if ((info as any).realModelReady) {
+        addLog('success', '🧠 PyTorch submodules loaded — real Inflect v2 inference active');
+      } else {
+        // No fallback in v2.1. Surface the exact reason the model didn't
+        // load so the user can debug (network, corrupted file, TorchScript
+        // incompat, OOM, missing permission, …).
+        const reason = (info as any).loadFailureReason || 'unknown reason';
+        addLog('error', `❌ Model failed to load. Synthesis will not work.`);
+        addLog('error', `   Reason: ${reason}`);
+        addLog('info', `   Tip: call redownloadModel() to retry, or check logcat for the full stack trace.`);
+        Alert.alert(
+          'Model load failed',
+          `The Inflect v2 model could not be loaded:\n\n${reason}\n\n` +
+          `Synthesis is disabled until this is fixed. Try "Redownload model" ` +
+          `or check the log panel for details.`,
+        );
+      }
 
     } catch (error) {
       addLog('error', `❌ Failed to load model: ${error}`);
@@ -262,9 +273,17 @@ const App: React.FC = () => {
         ]
       );
 
-    } catch (error) {
-      addLog('error', `❌ Inference failed: ${error}`);
-      Alert.alert('Error', `Inference failed: ${error}`);
+    } catch (error: any) {
+      // The native side rejects with code MODEL_NOT_LOADED (no model) or
+      // SYNTHESIS_ERROR (inference threw). The .message field already
+      // contains a human-readable cause chain built on the Kotlin side.
+      const code = error?.code || 'UNKNOWN';
+      const msg = error?.message || String(error);
+      addLog('error', `❌ Inference failed [${code}]: ${msg}`);
+      Alert.alert(
+        code === 'MODEL_NOT_LOADED' ? 'Model not loaded' : 'Inference failed',
+        `${msg}`,
+      );
     } finally {
       setIsInferring(false);
     }

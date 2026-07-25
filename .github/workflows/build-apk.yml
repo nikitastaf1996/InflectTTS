@@ -179,7 +179,7 @@ jobs:
 
             ### What's inside
             - React Native 0.86 + Hermes + New Architecture
-            - PyTorch Android 2.6 for on-device TorchScript inference
+            - PyTorch Android 2.1.0 for on-device TorchScript inference
             - HuggingFace submodule `nikitastaf1996/Inflect-Nano-v2-TorchScript`
               pinned at `models/Inflect-Nano-v2-TorchScript/` (source reference)
             - **First-run model download**: the app fetches the five scripted
@@ -187,9 +187,10 @@ jobs:
               `inflect_enc_q`, `inflect_flow`, `inflect_dp`, total ~20 MB)
               from HuggingFace on first launch and caches them in app-internal
               storage. Subsequent launches reuse the cached files.
-            - Real VITS-style inference reconstruction (enc_p → dp → flow → dec)
-              with automatic fallback to a simplified synth if the real path
-              fails.
+            - Real VITS-style inference reconstruction (enc_p → dp → flow → dec).
+              **No fallback synth** in v2.1 — if the model fails to load,
+              `synthesize()` rejects with `MODEL_NOT_LOADED` and a
+              human-readable reason (surfaced via `getModelInfo().loadFailureReason`).
 
             ### Model Info
             - **Model:** Inflect-Nano-v2

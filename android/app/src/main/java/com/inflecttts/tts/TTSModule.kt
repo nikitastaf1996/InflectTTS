@@ -20,15 +20,19 @@ import kotlin.random.Random
  *
  * Provides TTS inference for the Inflect Nano v2 model.
  *
- * Pipeline (v2.0 — submodule pathway):
+ * Pipeline (v2.1 — submodule pathway, no fallback):
  *   1. On `initializeModel()`, [ModelDownloader] pulls the five scripted
  *      submodule `.pt` files from the `nikitastaf1996/Inflect-Nano-v2-TorchScript`
  *      HuggingFace repo into the app's internal storage (cached for reuse).
  *   2. [InflectInference] loads those `.pt` files via PyTorch Android and
  *      reconstructs the `SynthesizerTrn.infer()` pipeline locally.
- *   3. `synthesize()` first attempts real model inference; if anything
- *      fails (e.g. submodule interface drift, OOM), it falls back to the
- *      legacy simplified synthesizer so the app remains usable.
+ *   3. `synthesize()` runs the real inference only. If the model failed
+ *      to load (network error, corrupted file, TorchScript incompat, OOM,
+ *      …), the call rejects with `MODEL_NOT_LOADED` and a human-readable
+ *      reason stored in `loadFailureReason` and surfaced via
+ *      `getModelInfo()`. The legacy simplified synth was removed in v2.1
+ *      — the app is either running the real Inflect v2 inference or it
+ *      is erroring out with a clear message.
  *
  * The HuggingFace repo is also pinned as a git submodule at
  * `models/Inflect-Nano-v2-TorchScript/` in this repository for source /
@@ -51,6 +55,13 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
 
     /** True when the real PyTorch submodules have been loaded successfully. */
     private var realModelReady = false
+
+    /**
+     * Human-readable reason why the real PyTorch submodules failed to load
+     * (null on success or before [initializeModel] runs). Surfaced to JS via
+     * `getModelInfo()` so the UI can show exactly what went wrong.
+     */
+    private var loadFailureReason: String? = null
 
     /** Pulls the five `.pt` files from HuggingFace on first run. */
     private val modelDownloader = ModelDownloader(reactContext)
@@ -158,23 +169,50 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 }
 
                 // ---- 2. Load scripted submodules via PyTorch Android ----
+                // No silent fallback — if the real model can't be loaded, we
+                // surface a clear reason to JS so the user can debug. The
+                // synth call later will reject with MODEL_NOT_LOADED.
                 val loadStart = System.currentTimeMillis()
                 try {
                     inference.load()
                     realModelReady = inference.isReady()
-                    Log.i(TAG, "InflectInference loaded in ${System.currentTimeMillis() - loadStart} ms (ready=$realModelReady)")
-                    emitProgress(
-                        if (realModelReady) "model_loaded" else "model_load_skipped",
-                        if (realModelReady) "PyTorch submodules loaded" else "Submodule load skipped — using fallback synth",
-                        1.0f,
-                    )
+                    if (!realModelReady) {
+                        // Defensive — load() should throw rather than leave
+                        // the modules unloaded, but guard anyway.
+                        loadFailureReason = "inference.load() returned but isReady()=false (unknown reason)"
+                        Log.e(TAG, loadFailureReason!!)
+                        emitProgress("model_load_failed", loadFailureReason!!, 1.0f)
+                    } else {
+                        loadFailureReason = null
+                        Log.i(TAG, "InflectInference loaded in ${System.currentTimeMillis() - loadStart} ms")
+                        emitProgress("model_loaded", "PyTorch submodules loaded", 1.0f)
+                    }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "Submodule load failed — will use fallback synth", t)
+                    // Build a detailed reason: short class name + message +
+                    // the first cause in the chain (typically the real culprit
+                    // for TorchScript load failures).
+                    val sb = StringBuilder()
+                    sb.append(t.javaClass.simpleName)
+                    if (!t.message.isNullOrBlank()) sb.append(": ").append(t.message)
+                    var cause: Throwable? = t.cause
+                    var depth = 0
+                    while (cause != null && depth < 3) {
+                        sb.append(" | caused by ")
+                            .append(cause.javaClass.simpleName)
+                        if (!cause.message.isNullOrBlank()) sb.append(": ").append(cause.message)
+                        cause = cause.cause
+                        depth++
+                    }
+                    loadFailureReason = sb.toString()
                     realModelReady = false
-                    emitProgress("model_load_failed", "Submodule load failed: ${t.message}", 1.0f)
+                    Log.e(TAG, "Submodule load failed: $loadFailureReason", t)
+                    emitProgress("model_load_failed", loadFailureReason!!, 1.0f)
                 }
 
                 // ---- 3. Initialize audio track for playback ----
+                // Even on model-load failure we still set up AudioTrack so
+                // subsequent re-attempts (e.g. after redownloadModel) don't
+                // need to re-init the audio engine.
                 val bufferSize = AudioTrack.getMinBufferSize(
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_OUT_MONO,
@@ -211,13 +249,16 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         putInt("sampleRate", SAMPLE_RATE)
                         putBoolean("realModelReady", realModelReady)
                         putString("modelSource", "huggingface:${ModelDownloader.HF_REPO}")
+                        putString("engine", if (realModelReady) "pytorch_submodules" else "none")
+                        putString("loadFailureReason", loadFailureReason)
                     })
                 }
 
-                Log.d(TAG, "Model initialized in ${modelLoadTime}ms (realModelReady=$realModelReady)")
+                Log.d(TAG, "Model initialized in ${modelLoadTime}ms (realModelReady=$realModelReady, reason=$loadFailureReason)")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize model", e)
+                loadFailureReason = "${e.javaClass.simpleName}: ${e.message}"
                 withContext(Dispatchers.Main) {
                     promise.reject("INIT_ERROR", e.message, e)
                 }
@@ -253,12 +294,19 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
     }
     
     /**
-     * Run TTS inference.
+     * Run TTS inference using the real PyTorch submodules.
      *
-     * If the real PyTorch submodules were loaded successfully during
-     * `initializeModel()`, this routes the request through [InflectInference].
-     * Otherwise (or if the real path throws), it falls back to the
-     * legacy simplified synthesizer so the app remains usable.
+     * No fallback: if the model failed to load during `initializeModel()`,
+     * this rejects with `MODEL_NOT_LOADED` and includes the captured
+     * `loadFailureReason` so the UI can show the user exactly why the
+     * model isn't available. The legacy simplified synthesizer was
+     * removed in v2.1 — the app is either running the real Inflect v2
+     * inference or it is erroring out.
+     *
+     * If inference throws at runtime (e.g. a scripted-submodule interface
+     * mismatch, OOM, or a shape error), the exception is wrapped with the
+     * same chain-walking pattern as `initializeModel()` so the JS side
+     * gets a single readable string under `error.message`.
      */
     @ReactMethod
     fun synthesize(
@@ -269,7 +317,20 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
         promise: Promise
     ) {
         if (!isInitialized) {
-            promise.reject("NOT_INITIALIZED", "Model not initialized")
+            promise.reject(
+                "NOT_INITIALIZED",
+                "Model not initialized. Call initializeModel() first.",
+            )
+            return
+        }
+        if (!realModelReady) {
+            val reason = loadFailureReason ?: "unknown reason"
+            val msg = "Model is not loaded. Reason: $reason. " +
+                "Call redownloadModel() to retry, or check logcat for details."
+            Log.e(TAG, "synthesize() rejected: $msg")
+            // promise.reject is safe to call from any thread; no need to
+            // hop to the main thread for a rejection.
+            promise.reject("MODEL_NOT_LOADED", msg)
             return
         }
 
@@ -294,136 +355,68 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 val phonemeTime = (System.nanoTime() - phonemeStart) / 1_000_000.0
                 timings.putDouble("phonemeEncoding", phonemeTime)
 
-                // -------- Real inference path (PyTorch submodules) --------
-                if (realModelReady) {
-                    try {
-                        val synthStart = System.nanoTime()
-                        Log.i(TAG, "Running real Inflect inference (text='${text.take(40)}…', phonemes=${phonemes.size})")
+                // -------- Real inference (only path) --------
+                val synthStart = System.nanoTime()
+                Log.i(TAG, "Running Inflect inference (text='${text.take(40)}…', phonemes=${phonemes.size})")
 
-                        // lengthScale = 1/speed (1.0 = normal, 2.0 = 2x slower).
-                        val lengthScale = if (speed > 0) (1.0f / speed.toFloat()) else 1.0f
-                        val raw = inference.infer(
-                            phonemes = phonemes.toIntArray(),
-                            noiseScale = variation.toFloat(),
-                            lengthScale = lengthScale,
-                            noiseScaleW = variation.toFloat(),
-                        )
-                        val synthTime = (System.nanoTime() - synthStart) / 1_000_000.0
-                        timings.putDouble("waveformSynthesis", synthTime)
-
-                        // Post-process (normalize + speed-aware resampling already
-                        // applied via lengthScale, so just normalize here).
-                        val postStart = System.nanoTime()
-                        val processedWaveform = postProcess(raw, 1.0f)
-                        val postTime = (System.nanoTime() - postStart) / 1_000_000.0
-                        timings.putDouble("postProcessing", postTime)
-
-                        val totalTime = (System.nanoTime() - totalStart) / 1_000_000.0
-
-                        results.pushMap(Arguments.createMap().apply {
-                            putString("step", "preprocessing"); putDouble("time", preprocessTime)
-                            putString("description", "Text normalization and cleaning")
-                        })
-                        results.pushMap(Arguments.createMap().apply {
-                            putString("step", "phonemeEncoding"); putDouble("time", phonemeTime)
-                            putString("description", "Convert text to phoneme sequence")
-                        })
-                        results.pushMap(Arguments.createMap().apply {
-                            putString("step", "waveformSynthesis"); putDouble("time", synthTime)
-                            putString("description", "Inflect v2 submodule pipeline (enc_p+dp+flow+dec)")
-                        })
-                        results.pushMap(Arguments.createMap().apply {
-                            putString("step", "postProcessing"); putDouble("time", postTime)
-                            putString("description", "Peak normalization")
-                        })
-
-                        val outputPath = saveWavFile(processedWaveform)
-                        playAudio(processedWaveform)
-
-                        withContext(Dispatchers.Main) {
-                            promise.resolve(Arguments.createMap().apply {
-                                putArray("timings", results)
-                                putDouble("totalTime", totalTime)
-                                putString("outputPath", outputPath)
-                                putInt("sampleRate", SAMPLE_RATE)
-                                putInt("audioLength", processedWaveform.size)
-                                putDouble("audioDuration", processedWaveform.size.toDouble() / SAMPLE_RATE)
-                                putString("engine", "pytorch_submodules")
-                            })
-                        }
-                        Log.d(TAG, "Real inference complete: ${totalTime.toInt()}ms")
-                        return@launch
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "Real inference failed — falling back to simplified synth", t)
-                        // Fall through to legacy path below.
+                // lengthScale = 1/speed (1.0 = normal, 2.0 = 2x slower).
+                val lengthScale = if (speed > 0) (1.0f / speed.toFloat()) else 1.0f
+                val raw = try {
+                    inference.infer(
+                        phonemes = phonemes.toIntArray(),
+                        noiseScale = variation.toFloat(),
+                        lengthScale = lengthScale,
+                        noiseScaleW = variation.toFloat(),
+                    )
+                } catch (t: Throwable) {
+                    // Walk the cause chain to give the user a single
+                    // readable string instead of just the top-level message.
+                    val sb = StringBuilder()
+                    sb.append("Inference failed: ")
+                        .append(t.javaClass.simpleName)
+                    if (!t.message.isNullOrBlank()) sb.append(": ").append(t.message)
+                    var cause: Throwable? = t.cause
+                    var depth = 0
+                    while (cause != null && depth < 3) {
+                        sb.append(" | caused by ")
+                            .append(cause.javaClass.simpleName)
+                        if (!cause.message.isNullOrBlank()) sb.append(": ").append(cause.message)
+                        cause = cause.cause
+                        depth++
                     }
+                    Log.e(TAG, sb.toString(), t)
+                    throw RuntimeException(sb.toString(), t)
                 }
+                val synthTime = (System.nanoTime() - synthStart) / 1_000_000.0
+                timings.putDouble("waveformSynthesis", synthTime)
 
-                // -------- Fallback: legacy simplified synthesizer --------
-
-                // Step 3: Duration prediction (simplified)
-                val durationStart = System.nanoTime()
-                val durations = predictDurations(phonemes)
-                val durationTime = (System.nanoTime() - durationStart) / 1_000_000.0
-                timings.putDouble("durationPrediction", durationTime)
-
-                // Step 4: Mel spectrogram generation (simplified)
-                val melStart = System.nanoTime()
-                val melSpec = generateMelSpectrogram(phonemes, durations)
-                val melTime = (System.nanoTime() - melStart) / 1_000_000.0
-                timings.putDouble("melGeneration", melTime)
-
-                // Step 5: Waveform synthesis (main inference)
-                val synthesisStart = System.nanoTime()
-                val waveform = synthesizeWaveform(melSpec, variation.toFloat(), seed)
-                val synthesisTime = (System.nanoTime() - synthesisStart) / 1_000_000.0
-                timings.putDouble("waveformSynthesis", synthesisTime)
-
-                // Step 6: Post-processing
+                // Post-process: just peak-normalize — speed is already
+                // applied via lengthScale inside the inference pipeline.
                 val postStart = System.nanoTime()
-                val processedWaveform = postProcess(waveform, speed.toFloat())
+                val processedWaveform = postProcess(raw, 1.0f)
                 val postTime = (System.nanoTime() - postStart) / 1_000_000.0
                 timings.putDouble("postProcessing", postTime)
 
-                // Calculate total time
                 val totalTime = (System.nanoTime() - totalStart) / 1_000_000.0
 
-                // Add each step to results
                 results.pushMap(Arguments.createMap().apply {
-                    putString("step", "preprocessing")
-                    putDouble("time", preprocessTime)
+                    putString("step", "preprocessing"); putDouble("time", preprocessTime)
                     putString("description", "Text normalization and cleaning")
                 })
                 results.pushMap(Arguments.createMap().apply {
-                    putString("step", "phonemeEncoding")
-                    putDouble("time", phonemeTime)
+                    putString("step", "phonemeEncoding"); putDouble("time", phonemeTime)
                     putString("description", "Convert text to phoneme sequence")
                 })
                 results.pushMap(Arguments.createMap().apply {
-                    putString("step", "durationPrediction")
-                    putDouble("time", durationTime)
-                    putString("description", "Predict phoneme durations")
+                    putString("step", "waveformSynthesis"); putDouble("time", synthTime)
+                    putString("description", "Inflect v2 submodule pipeline (enc_p+dp+flow+dec)")
                 })
                 results.pushMap(Arguments.createMap().apply {
-                    putString("step", "melGeneration")
-                    putDouble("time", melTime)
-                    putString("description", "Generate mel spectrogram features")
-                })
-                results.pushMap(Arguments.createMap().apply {
-                    putString("step", "waveformSynthesis")
-                    putDouble("time", synthesisTime)
-                    putString("description", "Neural vocoder waveform synthesis")
-                })
-                results.pushMap(Arguments.createMap().apply {
-                    putString("step", "postProcessing")
-                    putDouble("time", postTime)
-                    putString("description", "Audio normalization and resampling")
+                    putString("step", "postProcessing"); putDouble("time", postTime)
+                    putString("description", "Peak normalization")
                 })
 
-                // Save audio to file
                 val outputPath = saveWavFile(processedWaveform)
-
-                // Play audio
                 playAudio(processedWaveform)
 
                 withContext(Dispatchers.Main) {
@@ -434,11 +427,10 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         putInt("sampleRate", SAMPLE_RATE)
                         putInt("audioLength", processedWaveform.size)
                         putDouble("audioDuration", processedWaveform.size.toDouble() / SAMPLE_RATE)
-                        putString("engine", "fallback_synth")
+                        putString("engine", "pytorch_submodules")
                     })
                 }
-
-                Log.d(TAG, "Synthesis complete: ${totalTime.toInt()}ms")
+                Log.d(TAG, "Inference complete: ${totalTime.toInt()}ms")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Synthesis failed", e)
@@ -450,13 +442,16 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
     }
     
     /**
-     * Get model information.
+     * Get model information, including why the model failed to load
+     * (if applicable). The `loadFailureReason` field is null on success
+     * and a human-readable chain (exception class + message + up to 3
+     * caused-by clauses) on failure.
      */
     @ReactMethod
     fun getModelInfo(promise: Promise) {
         promise.resolve(Arguments.createMap().apply {
             putString("name", "Inflect-Nano-v2")
-            putString("version", "2.0")
+            putString("version", "2.1")
             putInt("parameters", MODEL_PARAMS)
             putString("size", "15.97 MB")
             putInt("sampleRate", SAMPLE_RATE)
@@ -464,7 +459,8 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
             putBoolean("isLoaded", isInitialized)
             putBoolean("realModelReady", realModelReady)
             putString("modelSource", "huggingface:${ModelDownloader.HF_REPO}")
-            putString("engine", if (realModelReady) "pytorch_submodules" else "fallback_synth")
+            putString("engine", if (realModelReady) "pytorch_submodules" else "none")
+            putString("loadFailureReason", loadFailureReason)
             putDouble("loadTime", modelLoadTime.toDouble())
         })
     }

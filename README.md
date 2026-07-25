@@ -123,7 +123,7 @@ InflectTTS/
 │   └── app/src/main/
 │       ├── java/com/inflecttts/
 │       │   └── tts/
-│       │       ├── TTSModule.kt        # RN native module (orchestration + fallback synth)
+│       │       ├── TTSModule.kt        # RN native module (orchestration; real inference only, no fallback)
 │       │       ├── ModelDownloader.kt  # Pulls .pt submodules from HuggingFace on first run
 │       │       ├── InflectInference.kt # Loads .pt files, reconstructs SynthesizerTrn.infer()
 │       │       └── TTSPackage.kt       # React Native package
@@ -142,7 +142,7 @@ InflectTTS/
 
 ## 🔧 Development
 
-### v2.0 submodule pathway
+### v2.1 submodule pathway (no fallback)
 
 The app uses the **scripted submodule** pathway described in the
 [HF README](https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript):
@@ -163,9 +163,13 @@ The app uses the **scripted submodule** pathway described in the
 
 4. **Inference** — `InflectInference.kt` loads each `.pt` as a
    `org.pytorch.Module` and runs the VITS-style pipeline:
-   `enc_p → dp → flow → dec`. If anything fails, `TTSModule.synthesize()`
-   falls back to the legacy simplified synthesizer so the app remains
-   usable.
+   `enc_p → dp → flow → dec`. If the model failed to load (network
+   error, corrupted file, TorchScript incompat, OOM, …), `synthesize()`
+   rejects with `MODEL_NOT_LOADED` and a human-readable reason stored
+   in `loadFailureReason` (surfaced via `getModelInfo()`). The legacy
+   simplified synthesizer was removed in v2.1 — the app is either
+   running the real Inflect v2 inference or it is erroring out with a
+   clear message.
 
 ### Native Module
 
@@ -173,16 +177,19 @@ The `TTSModule.kt` provides:
 
 - `initializeModel()` — download `.pt` submodules from HF (first run only),
   load them via PyTorch Android, initialize the audio engine. Emits
-  `InflectTTS_ModelProgress` events during download.
-- `synthesize(text, speed, variation, seed)` — real model inference
-  with automatic fallback to simplified synth.
+  `InflectTTS_ModelProgress` events during download. On load failure,
+  captures a human-readable reason in `loadFailureReason`.
+- `synthesize(text, speed, variation, seed)` — **real inference only**.
+  Rejects with `MODEL_NOT_LOADED` if the model didn't load; rejects
+  with `SYNTHESIS_ERROR` (and a cause-chain message) if inference throws.
 - `redownloadModel()` — clear the cache and re-download the submodules.
-- `getModelInfo()` — model metadata + `realModelReady` flag + `engine` field.
+- `getModelInfo()` — model metadata + `realModelReady` flag + `engine`
+  field + `loadFailureReason` (null on success).
 
 ### Legacy ONNX export (optional)
 
 The repo still ships `scripts/export_onnx.py` for users who prefer the
-ONNX Runtime pathway. It is **not** used by the v2.0 runtime — the app
+ONNX Runtime pathway. It is **not** used by the v2.1 runtime — the app
 loads `.pt` files via PyTorch Android instead.
 
 ```bash
