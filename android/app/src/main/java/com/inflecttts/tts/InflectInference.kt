@@ -129,12 +129,13 @@ class InflectInference(private val context: Context) {
         check(isLoaded) { "InflectInference not loaded — call load() first" }
 
         // -------- 0. Prepare token tensor [1, MAX_SEQ_LEN] (int64) --------
+        // PyTorch Android 2.1.0 exposes `Tensor.fromBlob(long[], long[])` (no `fromBlobLong`).
         val seq = IntArray(MAX_SEQ_LEN) { 0 }
         val realLen = min(phonemes.size, MAX_SEQ_LEN)
         System.arraycopy(phonemes, 0, seq, 0, realLen)
         val seqLong = LongArray(MAX_SEQ_LEN) { i -> seq[i].toLong() }
-        val tokensTensor = Tensor.fromBlobLong(seqLong, longArrayOf(1, MAX_SEQ_LEN.toLong()))
-        val lengthsTensor = Tensor.fromBlobLong(longArrayOf(realLen.toLong()), longArrayOf(1))
+        val tokensTensor = Tensor.fromBlob(seqLong, longArrayOf(1, MAX_SEQ_LEN.toLong()))
+        val lengthsTensor = Tensor.fromBlob(longArrayOf(realLen.toLong()), longArrayOf(1))
 
         // -------- 1. enc_p.forward(tokens, lengths) -> (x, m_p, logs_p, x_mask) --------
         val encOut = encP!!.forward(IValue.from(tokensTensor), IValue.from(lengthsTensor)).toTuple()
@@ -173,8 +174,8 @@ class InflectInference(private val context: Context) {
         // w = exp(logw) * x_mask * length_scale
         // w_ceil = ceil(w)
         // y_lengths = clamp(sum(w_ceil), 1)
-        val logwArr = logw.dataAsFloatArray
-        val xMaskArr = xMaskTensor.dataAsFloatArray
+        val logwArr = logw.getDataAsFloatArray()
+        val xMaskArr = xMaskTensor.getDataAsFloatArray()
         val tText = (xMaskTensor.shape()[2]).toInt()
         val wCeil = IntArray(tText)
         var yLenSum = 0L
@@ -213,8 +214,8 @@ class InflectInference(private val context: Context) {
         // -------- 5. Expand m_p, logs_p along time via attn --------
         // m_p_expanded[1, inter, t_y] = sum_t(attn[t_y, t] * m_p[1, inter, t])
         // We do this in Kotlin because matmul via Tensor is awkward here.
-        val mPArr = mPTensor.dataAsFloatArray   // [1, inter, t_text] flattened row-major
-        val logsPArr = logsPTensor.dataAsFloatArray
+        val mPArr = mPTensor.getDataAsFloatArray()   // [1, inter, t_text] flattened row-major
+        val logsPArr = logsPTensor.getDataAsFloatArray()
         val inter = (mPTensor.shape()[1]).toInt()
         val mPExp = FloatArray(inter * yLengths)
         val logsPExp = FloatArray(inter * yLengths)
@@ -234,7 +235,10 @@ class InflectInference(private val context: Context) {
         }
 
         // z_p = m_p + randn_like(m_p) * exp(logs_p) * noise_scale
-        val rand = kotlin.random.Random(System.nanoTime())
+        // Use java.util.Random for nextGaussian() — Kotlin's Random doesn't
+        // expose nextGaussian() in older stdlib versions and may need
+        // ExperimentalStdlibApi opt-in.
+        val rand = java.util.Random(System.nanoTime())
         val zP = FloatArray(inter * yLengths)
         for (i in zP.indices) {
             val r = rand.nextGaussian().toFloat()
@@ -255,12 +259,12 @@ class InflectInference(private val context: Context) {
         Log.d(TAG, "flow: z=${zTensor.shape().contentToString()}")
 
         // z * y_mask (y_mask already 1.0 in valid region)
-        val zArr = zTensor.dataAsFloatArray
+        val zArr = zTensor.getDataAsFloatArray()
 
         // -------- 7. dec.forward(z * y_mask) -> waveform --------
         val outTensor = dec!!.forward(IValue.from(zTensor)).toTensor()
         Log.d(TAG, "dec: out=${outTensor.shape().contentToString()}")
 
-        return outTensor.dataAsFloatArray
+        return outTensor.getDataAsFloatArray()
     }
 }

@@ -180,9 +180,6 @@ class ModelDownloader(private val context: Context) {
             }
 
             if (tmp.length() != model.expectedSize) {
-                onProgress(Progress.Warning(
-                    "${model.name}: size mismatch (got ${tmp.length()}, expected ${model.expectedSize})"
-                ))
                 Log.w(TAG, "${model.name}: size ${tmp.length()} != expected ${model.expectedSize}")
             }
 
