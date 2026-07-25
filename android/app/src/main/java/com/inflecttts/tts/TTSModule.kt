@@ -503,23 +503,26 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 timings.putDouble("preprocessing", preprocessTime)
                 Log.i(TAG, "step=preprocessing: OK — normalized='${normalized.take(40)}…'")
 
-                // Step 2: Text to phonemes
+                // Step 2: Text → IPA phonemes → token IDs (via InflectG2P)
+                // Uses rule-based English g2p to produce IPA token IDs that
+                // match the model's symbols table (eSpeak IPA, not ARPABET).
+                // Also handles add_blank=true (intersperse pad between tokens).
                 inference.lastInferenceStep = "phoneme_encoding"
                 val phonemeStart = System.nanoTime()
-                val phonemes = textToPhonemes(normalized)
+                val phonemes = InflectG2P.textToTokenIds(text)  // pass ORIGINAL text (g2p normalizes internally)
                 val phonemeTime = (System.nanoTime() - phonemeStart) / 1_000_000.0
                 timings.putDouble("phonemeEncoding", phonemeTime)
-                Log.i(TAG, "step=phoneme_encoding: OK — ${phonemes.size} phonemes")
+                Log.i(TAG, "step=phoneme_encoding: OK — ${phonemes.size} tokens (with interspersed pad)")
 
                 // -------- Real inference (only path) --------
                 val synthStart = System.nanoTime()
-                Log.i(TAG, "Running Inflect inference (text='${text.take(40)}…', phonemes=${phonemes.size})")
+                Log.i(TAG, "Running Inflect inference (text='${text.take(40)}…', tokens=${phonemes.size})")
 
                 // lengthScale = 1/speed (1.0 = normal, 2.0 = 2x slower).
                 val lengthScale = if (speed > 0) (1.0f / speed.toFloat()) else 1.0f
                 val raw = try {
                     inference.infer(
-                        phonemes = phonemes.toIntArray(),
+                        phonemes = phonemes,
                         noiseScale = variation.toFloat(),
                         lengthScale = lengthScale,
                         noiseScaleW = variation.toFloat(),
