@@ -150,7 +150,11 @@ class InflectInference(private val context: Context) {
         // for small tensors. But it ensures we don't underutilize the CPU.
         val numThreads = Runtime.getRuntime().availableProcessors()
         try {
-            org.pytorch.PyTorchAndroid.setNumThreads(numThreads)
+            // IMPORTANT: use LitePyTorchAndroid (not PyTorchAndroid) because
+            // we're on pytorch_android_lite. PyTorchAndroid would try to load
+            // libpytorch_jni.so (full runtime) which doesn't exist in the
+            // lite AAR — only libpytorch_jni_lite.so exists.
+            org.pytorch.LitePyTorchAndroid.setNumThreads(numThreads)
             Log.i(TAG, "Set PyTorch thread count to $numThreads (availableProcessors)")
         } catch (t: Throwable) {
             Log.w(TAG, "setNumThreads($numThreads) failed (non-fatal): ${t.message}")
@@ -175,6 +179,12 @@ class InflectInference(private val context: Context) {
     /**
      * Load a single `.ptl` (lite interpreter) file, wrapping any exception
      * with the filename and file size so the failure is easy to diagnose.
+     *
+     * IMPORTANT: uses LiteModuleLoader.load() (not Module.load()) because
+     * we're on pytorch_android_lite. Module.load() would use the full
+     * NativePeer which tries to load libpytorch_jni.so — that .so doesn't
+     * exist in the lite AAR (only libpytorch_jni_lite.so exists), causing
+     * "SoLoader dsonotfound couldn't find dso to load libpytorch_jni.so".
      */
     private fun loadOne(name: String): Module {
         val file = File(modelDir, name)
@@ -182,7 +192,7 @@ class InflectInference(private val context: Context) {
         val sizeStr = if (sizeBytes >= 0) "${sizeBytes / 1024} KB" else "MISSING"
         Log.d(TAG, "Loading $name ($sizeStr) from ${modelDir.absolutePath}")
         return try {
-            Module.load(file.absolutePath)
+            org.pytorch.LiteModuleLoader.load(file.absolutePath)
         } catch (t: Throwable) {
             // Re-throw with a richer message that includes the filename
             // and on-disk size — the original exception is preserved as
