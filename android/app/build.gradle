@@ -82,8 +82,8 @@ android {
         applicationId "com.inflecttts"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 16
-        versionName "2.5.1"
+        versionCode 17
+        versionName "2.6.0"
     }
 
     // PyTorch Android (transitively) and React Native both ship
@@ -137,26 +137,27 @@ dependencies {
         implementation jscFlavor
     }
 
-    // PyTorch Android for on-device TorchScript model inference.
-    // We use the full (non-lite) variant because the HuggingFace
-    // submodule repo ships `.pt` files produced by `torch.jit.script().save()`,
-    // which are not lite-interpreter `.ptl` files. The full runtime can
-    // load both; the lite runtime can only load `.ptl`.
+    // PyTorch Android Lite for on-device TorchScript model inference.
+    //
+    // We use the LITE variant because the HuggingFace repo now ships both
+    // .pt (full TorchScript) AND .ptl (lite interpreter) files. The .ptl
+    // files are produced by torch.utils.mobile_optimizer.optimize_for_mobile()
+    // which applies operator fusion, constant folding, and XNNPACK-specific
+    // optimizations — typically 20-40% faster on CPU.
+    //
+    // The lite runtime can ONLY load .ptl files (not .pt). The app
+    // downloads .ptl files from HF on first run (see ModelDownloader.kt).
     //
     // NOTE: 2.1.0 is the latest version published to Maven Central as of
     // 2026-07. The HF README references 2.6.0 but that version was never
-    // published to Maven Central; 2.1.0 is forward-compatible with
-    // TorchScript files produced by newer PyTorch versions for the ops
-    // used in this model.
+    // published to Maven Central.
     //
     // The `fbjni-java-only` transitive dep from PyTorch conflicts with
     // React Native's `fbjni:0.7.0` (both ship `com.facebook.jni.*`
     // classes). Excluding the java-only variant lets RN's full fbjni
     // (with native bits) win, and PyTorch's JNI calls still resolve
     // at runtime because fbjni-0.7.0 is API-compatible.
-    // The five scripted submodule .pt files are pulled from HuggingFace
-    // on first run (see ModelDownloader.kt) and reconstructed locally.
-    implementation('org.pytorch:pytorch_android:2.1.0') {
+    implementation('org.pytorch:pytorch_android_lite:2.1.0') {
         exclude group: 'com.facebook.fbjni', module: 'fbjni-java-only'
     }
 }

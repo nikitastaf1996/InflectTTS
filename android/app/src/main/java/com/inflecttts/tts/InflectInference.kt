@@ -135,25 +135,46 @@ class InflectInference(private val context: Context) {
         }
         Log.i(TAG, "Loading scripted submodules from ${modelDir.absolutePath}")
 
+        // ---- Set PyTorch thread count ----
+        // PyTorch Android defaults to using all available cores, but on
+        // big.LITTLE SoCs the OS scheduler may pin inference threads to
+        // LITTLE cores for thermal/battery reasons. Setting an explicit
+        // count tells PyTorch's backend (XNNPACK) to use that many threads
+        // for parallel ops (matmul, conv).
+        //
+        // We use availableProcessors() (= core count). On modern phones
+        // (e.g. 1+3+4 big.LITTLE), this is typically 8, and PyTorch will
+        // spread work across all cores. On older 1+3 designs it's 4.
+        //
+        // This is a hint, not a guarantee — XNNPACK may use fewer threads
+        // for small tensors. But it ensures we don't underutilize the CPU.
+        val numThreads = Runtime.getRuntime().availableProcessors()
+        try {
+            org.pytorch.PyTorchAndroid.setNumThreads(numThreads)
+            Log.i(TAG, "Set PyTorch thread count to $numThreads (availableProcessors)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "setNumThreads($numThreads) failed (non-fatal): ${t.message}")
+        }
+
         val t0 = System.currentTimeMillis()
 
         // Per-module load with descriptive errors. Each Module.load() can
         // throw RuntimeException (file not found, TorchScript parse error,
         // unsupported op, …). We wrap each one so the stack trace shows
         // exactly which file was being loaded when the failure happened.
-        encP = loadOne("inflect_enc_p.pt")
-        dec  = loadOne("inflect_dec.pt")
-        encQ = loadOne("inflect_enc_q.pt")
-        flow = loadOne("inflect_flow.pt")
-        dp   = loadOne("inflect_dp.pt")
+        encP = loadOne("inflect_enc_p.ptl")
+        dec  = loadOne("inflect_dec.ptl")
+        encQ = loadOne("inflect_enc_q.ptl")
+        flow = loadOne("inflect_flow.ptl")
+        dp   = loadOne("inflect_dp.ptl")
 
         isLoaded = true
         Log.i(TAG, "All submodules loaded in ${System.currentTimeMillis() - t0} ms")
     }
 
     /**
-     * Load a single `.pt` file, wrapping any exception with the filename
-     * and file size so the failure is easy to diagnose.
+     * Load a single `.ptl` (lite interpreter) file, wrapping any exception
+     * with the filename and file size so the failure is easy to diagnose.
      */
     private fun loadOne(name: String): Module {
         val file = File(modelDir, name)

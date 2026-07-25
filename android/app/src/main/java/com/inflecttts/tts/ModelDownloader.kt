@@ -14,9 +14,14 @@ import kotlin.math.min
 /**
  * ModelDownloader
  *
- * Pulls the five scripted submodule `.pt` files from the
+ * Pulls the five lite-interpreter submodule `.ptl` files from the
  * `nikitastaf1996/Inflect-Nano-v2-TorchScript` HuggingFace
  * repository into the app's internal files directory on first run.
+ *
+ * The `.ptl` files are produced by
+ * `torch.utils.mobile_optimizer.optimize_for_mobile()` — they apply
+ * operator fusion, constant folding, and XNNPACK optimizations for
+ * 20-40% faster CPU inference vs. the `.pt` (full TorchScript) files.
  *
  * The same files are also referenced as a git submodule at
  * `models/Inflect-Nano-v2-TorchScript/` in the InflectTTS repo
@@ -26,13 +31,13 @@ import kotlin.math.min
  * bundled.
  *
  * Files (see HF README "Submodule TorchScript pathway"):
- *   - inflect_enc_p.pt  (2.4 MB)  TextEncoder
- *   - inflect_dec.pt    (8.2 MB)  Generator
- *   - inflect_enc_q.pt  (4.1 MB)  PosteriorEncoder
- *   - inflect_flow.pt   (4.0 MB)  ResidualCouplingBlock
- *   - inflect_dp.pt     (1.0 MB)  DurationPredictor
+ *   - inflect_enc_p.ptl  (2.3 MB)  TextEncoder
+ *   - inflect_dec.ptl    (8.0 MB)  Generator
+ *   - inflect_enc_q.ptl  (1.2 MB)  PosteriorEncoder (smaller after optimization)
+ *   - inflect_flow.ptl   (4.0 MB)  ResidualCouplingBlock
+ *   - inflect_dp.ptl     (1.0 MB)  DurationPredictor
  *
- * Total: ~19.7 MB. Downloaded once, cached, and reused.
+ * Total: ~16.5 MB. Downloaded once, cached, and reused.
  */
 class ModelDownloader(private val context: Context) {
 
@@ -46,19 +51,27 @@ class ModelDownloader(private val context: Context) {
         private const val HF_BASE =
             "https://huggingface.co/$HF_REPO/resolve/main/"
 
-        /** Subdirectory under `context.filesDir` where the .pt files live. */
+        /** Subdirectory under `context.filesDir` where the .ptl files live. */
         const val MODEL_DIR_NAME = "inflect_model"
 
         /**
-         * The five scripted submodule files. Order matters for the progress
-         * callback: largest first to give the user a smoother percentage.
+         * The five lite-interpreter submodule files (.ptl). Order matters
+         * for the progress callback: largest first to give the user a
+         * smoother percentage.
+         *
+         * .ptl files are produced by torch.utils.mobile_optimizer.optimize_for_mobile()
+         * — they apply operator fusion, constant folding, and XNNPACK
+         * optimizations. Typically 20-40% faster on CPU than .pt files.
+         *
+         * Sizes are the exact byte counts from the HF repo (verified
+         * 2026-07-25). allPresent() uses these to detect partial downloads.
          */
         val MODEL_FILES: List<ModelFile> = listOf(
-            ModelFile("inflect_dec.pt",    8_554_239L),
-            ModelFile("inflect_enc_q.pt",  4_241_861L),
-            ModelFile("inflect_flow.pt",   4_113_170L),
-            ModelFile("inflect_enc_p.pt",  2_434_862L),
-            ModelFile("inflect_dp.pt",     1_030_942L),
+            ModelFile("inflect_dec.ptl",    8_446_534L),
+            ModelFile("inflect_flow.ptl",   4_154_831L),
+            ModelFile("inflect_enc_p.ptl",  2_433_783L),
+            ModelFile("inflect_enc_q.ptl",  1_241_449L),
+            ModelFile("inflect_dp.ptl",     1_024_525L),
         )
 
         /** Aggregate byte size of all submodule weights. */
@@ -106,15 +119,30 @@ class ModelDownloader(private val context: Context) {
     }
 
     /**
-     * Ensure every submodule .pt file exists locally. Files already present
+     * Ensure every submodule .ptl file exists locally. Files already present
      * are left untouched. Missing files are downloaded from HuggingFace
      * with progress callbacks. Runs on the calling thread — call from a
      * background coroutine.
      *
-     * @return the directory containing the .pt files.
+     * Also cleans up legacy .pt files (from v2.4.0 and earlier) to free
+     * disk space — the app now uses .ptl (lite interpreter) exclusively.
+     *
+     * @return the directory containing the .ptl files.
      */
     fun ensureModels(onProgress: (Progress) -> Unit = {}): File {
         if (!modelDir.exists()) modelDir.mkdirs()
+
+        // ---- Clean up legacy .pt files (v2.4.0 and earlier) ----
+        // The app switched from .pt to .ptl in v2.6.0. Old .pt files are
+        // ~20 MB of dead weight — delete them so they don't waste storage.
+        val legacyPtFiles = modelDir.listFiles { f -> f.name.endsWith(".pt") }
+        if (legacyPtFiles != null && legacyPtFiles.isNotEmpty()) {
+            Log.i(TAG, "Cleaning up ${legacyPtFiles.size} legacy .pt files (switching to .ptl)")
+            legacyPtFiles.forEach { f ->
+                if (f.delete()) Log.d(TAG, "  Deleted legacy ${f.name}")
+                else Log.w(TAG, "  Failed to delete legacy ${f.name}")
+            }
+        }
 
         val total = MODEL_FILES.size
         var downloadedNow = 0
