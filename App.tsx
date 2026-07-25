@@ -267,8 +267,12 @@ const App: React.FC = () => {
       }
       if (diag.loadFailureStacktrace) {
         lines.push('');
-        lines.push('loadFailureStacktrace (first 30 lines):');
-        diag.loadFailureStacktrace.split('\n').slice(0, 30).forEach((l: string) => lines.push(`  ${l}`));
+        lines.push('loadFailureStacktrace (first 15 lines):');
+        diag.loadFailureStacktrace.split('\n').slice(0, 15).forEach((l: string) => lines.push(`  ${l}`));
+        const totalLines = diag.loadFailureStacktrace.split('\n').length;
+        if (totalLines > 15) {
+          lines.push(`  ... (${totalLines - 15} more lines — full trace in logcat)`);
+        }
       }
       lines.push('');
       lines.push('--- Files ---');
@@ -283,9 +287,12 @@ const App: React.FC = () => {
       lines.push('');
       lines.push('--- PyTorch Native Lib Probe ---');
       if (diag.pytorchProbe) {
-        lines.push(`  classLoaded: ${diag.pytorchProbe.classLoaded}`);
+        lines.push(`  classOnClasspath: ${diag.pytorchProbe.classOnClasspath}`);
         lines.push(`  nativeLibProbed: ${diag.pytorchProbe.nativeLibProbed}`);
         lines.push(`  nativeLibStatus: ${diag.pytorchProbe.nativeLibStatus}`);
+        if (diag.pytorchProbe.probeNote) {
+          lines.push(`  probeNote: ${diag.pytorchProbe.probeNote}`);
+        }
       }
       lines.push('');
       lines.push('--- Inference Modules ---');
@@ -321,7 +328,7 @@ const App: React.FC = () => {
       }
       if (diag.pytorchProbe) {
         addLog('info', `   PyTorch probe:`);
-        addLog('info', `     classLoaded: ${diag.pytorchProbe.classLoaded}`);
+        addLog('info', `     classOnClasspath: ${diag.pytorchProbe.classOnClasspath}`);
         addLog('info', `     nativeLibStatus: ${diag.pytorchProbe.nativeLibStatus}`);
       }
       if (diag.inference) {
