@@ -308,7 +308,7 @@ object InflectG2P {
             next == 'e' -> EY        // ae → eɪ (rarely)
             next == 'o' -> AO        // ao → ɔ
             next == 'l' || next == 'w' -> AO  // all, law → ɔ
-            next == 's' || next == 'f' || next == 'n' || next == 'th' -> AE  // ask, after, ankle (a-fronting)
+            next == 's' || next == 'f' || next == 'n' -> AE  // ask, after, ankle (a-fronting)
             next == 0.toChar() -> AH  // word-final a → schwa
             else -> AE                // default: cat
         }
