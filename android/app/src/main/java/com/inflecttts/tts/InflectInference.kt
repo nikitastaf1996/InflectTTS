@@ -280,28 +280,38 @@ class InflectInference(private val context: Context) {
             "x_mask=${xMaskTensor.shape().contentToString()}")
 
         // -------- 2. dp.forward(x, x_mask[, reverse, noise_scale]) --------
-        // With `use_sdp=false` (see config.json), `dp` is a deterministic
-        // `DurationPredictor` whose scripted forward signature is
-        // `forward(x, x_mask)` and returns `logw` directly. With
-        // `use_sdp=true` it would be a `StochasticDurationPredictor` whose
-        // forward is `forward(x, x_mask, reverse, noise_scale)`.
-        // We try the deterministic signature first (matches our config),
-        // then fall back to the stochastic one.
+        // Per the HF README, the scripted dp.forward signature is:
+        //   dp.forward(x, x_mask, reverse=True, noise_scale=noise_scale_w) -> logw
+        // (4 args — StochasticDurationPredictor signature).
+        //
+        // With `use_sdp=false` (see config.json), `dp` MIGHT be a
+        // deterministic `DurationPredictor` whose scripted forward is
+        // `forward(x, x_mask)` (2 args). But the README's reconstruction
+        // steps use the 4-arg form, so we try that FIRST. If the 4-arg
+        // call throws (not crashes — a clean Java exception), we fall
+        // back to the 2-arg form.
+        //
+        // IMPORTANT: we must try the form the README specifies FIRST.
+        // The previous version tried 2 args first, but if the scripted
+        // module actually expects 4 args, the 2-arg call can trigger a
+        // native SIGSEGV (process crash) instead of a clean exception —
+        // and we'd never reach the fallback.
         lastInferenceStep = "dp_forward"
-        Log.i(TAG, "step=$lastInferenceStep: calling dp.forward(x, x_mask) [deterministic]")
+        Log.i(TAG, "step=$lastInferenceStep: calling dp.forward(x, x_mask, reverse=true, " +
+            "noise_scale=$noiseScaleW) [4-arg stochastic, per HF README]")
         val logw: Tensor = try {
-            dp!!.forward(
-                IValue.from(xTensor),
-                IValue.from(xMaskTensor),
-            ).toTensor()
-        } catch (t1: Throwable) {
-            Log.w(TAG, "step=$lastInferenceStep: deterministic failed (${t1.message}); " +
-                "trying stochastic signature dp.forward(x, x_mask, reverse=true, noise_scale=$noiseScaleW)")
             dp!!.forward(
                 IValue.from(xTensor),
                 IValue.from(xMaskTensor),
                 IValue.from(true),
                 IValue.from(noiseScaleW.toDouble()),
+            ).toTensor()
+        } catch (t1: Throwable) {
+            Log.w(TAG, "step=$lastInferenceStep: 4-arg stochastic failed (${t1.message}); " +
+                "trying 2-arg deterministic signature dp.forward(x, x_mask)")
+            dp!!.forward(
+                IValue.from(xTensor),
+                IValue.from(xMaskTensor),
             ).toTensor()
         }
         Log.i(TAG, "step=$lastInferenceStep: OK — logw=${logw.shape().contentToString()}")
@@ -400,10 +410,25 @@ class InflectInference(private val context: Context) {
         ).toTensor()
         Log.i(TAG, "step=$lastInferenceStep: OK — z=${zTensor.shape().contentToString()}")
 
-        // -------- 7. dec.forward(z * y_mask) -> waveform --------
+        // -------- 7. dec.forward(z * y_mask, max_len=4000) -> waveform --------
+        // Per the HF README reconstruction step 9:
+        //   o = dec.forward(z * y_mask, max_len=4000)
+        // The scripted decoder takes TWO args: the latent z (already
+        // masked) and max_len (int). The previous version passed only 1
+        // arg, which likely triggered the native SIGSEGV crash.
+        //
+        // Apply y_mask to z first (z * y_mask), then forward with max_len.
         lastInferenceStep = "dec_forward"
-        Log.i(TAG, "step=$lastInferenceStep: calling dec.forward(z=${zTensor.shape().contentToString()})")
-        val outTensor = dec!!.forward(IValue.from(zTensor)).toTensor()
+        // z * y_mask — y_mask is [1, 1, y_len] of ones, so for valid
+        // regions z is unchanged. We just pass z directly since y_mask
+        // is all-ones in the valid region (we built it that way).
+        val maxLen = 4000
+        Log.i(TAG, "step=$lastInferenceStep: calling dec.forward(z=${zTensor.shape().contentToString()}, " +
+            "max_len=$maxLen) [2-arg, per HF README]")
+        val outTensor = dec!!.forward(
+            IValue.from(zTensor),
+            IValue.from(maxLen.toLong()),
+        ).toTensor()
         Log.i(TAG, "step=$lastInferenceStep: OK — out=${outTensor.shape().contentToString()}")
 
         lastInferenceStep = "done"
