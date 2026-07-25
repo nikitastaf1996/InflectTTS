@@ -217,7 +217,33 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                     // Build a detailed reason: short class name + message +
                     // the first cause in the chain (typically the real culprit
                     // for TorchScript load failures).
-                    loadFailureReason = buildFailureReason(t)
+                    val baseReason = buildFailureReason(t)
+                    // Append a hint about the most likely root cause when
+                    // the load failure looks like a TorchScript incompat.
+                    // The HF repo's .pt files were scripted with a newer
+                    // PyTorch (README mentions 2.6.0); the mobile runtime
+                    // is 2.1.0 (latest on Maven Central). If the scripted
+                    // model uses ops added after 2.1.0, loading fails with
+                    // messages like "Unknown operator X" or "version X
+                    // is newer than current version Y".
+                    val hint = if (
+                        baseReason.contains("Unknown operator", ignoreCase = true) ||
+                        baseReason.contains("is newer than", ignoreCase = true) ||
+                        baseReason.contains("version", ignoreCase = true) ||
+                        baseReason.contains("op", ignoreCase = true) ||
+                        baseReason.contains("CppException", ignoreCase = true)
+                    ) {
+                        "\n\nLikely cause: TorchScript version mismatch. " +
+                            "The .pt files were scripted with a newer PyTorch " +
+                            "(see HF README — mentions 2.6.0), but the latest " +
+                            "PyTorch Android on Maven Central is 2.1.0. " +
+                            "The scripted model uses ops not in 2.1.0. " +
+                            "Fix: re-script the model with PyTorch 2.1.0 on " +
+                            "the HF side, or use the lite-interpreter (.ptl) " +
+                            "pathway with a model exported via " +
+                            "optimize_for_mobile()."
+                    } else ""
+                    loadFailureReason = baseReason + hint
                     loadFailureStacktrace = stackTraceToString(t)
                     realModelReady = false
                     Log.e(TAG, "Submodule load failed: $loadFailureReason", t)
@@ -540,35 +566,78 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                 }
                 result.putArray("files", filesArr)
 
-                // Best-effort PyTorch native-lib probe: touch the Module class
-                // and report whether it's loaded. UnsatisfiedLinkError here
-                // would mean PyTorch's native libs don't support this device.
+                // Best-effort PyTorch native-lib probe.
+                //
+                // The native libs (libpytorch_jni.so) are loaded by a static
+                // initializer in org.pytorch.Module via SoLoader. If
+                // Class.forName() succeeds WITHOUT throwing
+                // ExceptionInInitializerError, the native libs loaded OK.
+                // If it throws ExceptionInInitializerError with an
+                // UnsatisfiedLinkError cause, the native lib is missing or
+                // the device ABI is unsupported.
+                //
+                // We then probe Module.load("/nonexistent") via reflection.
+                // If the native lib is healthy, this throws a regular
+                // RuntimeException ("file not found"). If the native lib is
+                // broken, it throws UnsatisfiedLinkError — which is the
+                // actual signal we want to surface.
                 val pytorchProbe = Arguments.createMap()
                 try {
                     val cls = Class.forName("org.pytorch.Module")
                     pytorchProbe.putBoolean("classLoaded", true)
                     pytorchProbe.putString("classLoader", cls.classLoader?.toString() ?: "null")
-                    // Try to access a static method to force native-lib load.
-                    // Module.moduleInitProgressListener() is a no-op static
-                    // that exists in 2.1.0; if it throws UnsatisfiedLinkError,
-                    // the native lib failed to load.
+
+                    // Probe: call Module.load("/nonexistent") via reflection.
+                    val loadMethod = cls.getDeclaredMethod("load", String::class.java)
                     try {
-                        cls.getDeclaredMethod("moduleInitProgressListener")
+                        loadMethod.invoke(null, "/data/local/tmp/__pytorch_probe_does_not_exist__")
+                        // Shouldn't reach here — load() always throws for missing files.
                         pytorchProbe.putBoolean("nativeLibProbed", true)
-                        pytorchProbe.putString("nativeLibStatus", "class loads; native lib appears OK")
-                    } catch (nsme: NoSuchMethodException) {
-                        pytorchProbe.putBoolean("nativeLibProbed", false)
-                        pytorchProbe.putString("nativeLibStatus", "class loads but probe method not found (PyTorch API may differ)")
-                    } catch (ule: UnsatisfiedLinkError) {
-                        pytorchProbe.putBoolean("nativeLibProbed", false)
-                        pytorchProbe.putString("nativeLibStatus", "UnsatisfiedLinkError: ${ule.message}")
+                        pytorchProbe.putString("nativeLibStatus",
+                            "UNEXPECTED: Module.load() returned without throwing for a nonexistent path. " +
+                            "Native lib appears OK but PyTorch behaviour is unusual.")
+                    } catch (inv: java.lang.reflect.InvocationTargetException) {
+                        val cause = inv.targetException
+                        when (cause) {
+                            is UnsatisfiedLinkError -> {
+                                pytorchProbe.putBoolean("nativeLibProbed", false)
+                                pytorchProbe.putString("nativeLibStatus",
+                                    "UnsatisfiedLinkError: ${cause.message}. " +
+                                    "PyTorch's native lib (libpytorch_jni.so) failed to load — " +
+                                    "the device ABI may be unsupported or the .so files are missing from the APK.")
+                            }
+                            is RuntimeException -> {
+                                // Expected: "File not found" or similar.
+                                pytorchProbe.putBoolean("nativeLibProbed", true)
+                                pytorchProbe.putString("nativeLibStatus",
+                                    "Native lib loaded OK (Module.load() reached file-not-found path, " +
+                                    "meaning libpytorch_jni.so is healthy). " +
+                                    "PyTorch native runtime is available on this device.")
+                            }
+                            else -> {
+                                pytorchProbe.putBoolean("nativeLibProbed", false)
+                                pytorchProbe.putString("nativeLibStatus",
+                                    "${cause.javaClass.simpleName}: ${cause.message}")
+                            }
+                        }
                     }
                 } catch (cnfe: ClassNotFoundException) {
                     pytorchProbe.putBoolean("classLoaded", false)
-                    pytorchProbe.putString("nativeLibStatus", "org.pytorch.Module class NOT FOUND — PyTorch dependency not on classpath")
+                    pytorchProbe.putString("nativeLibStatus",
+                        "org.pytorch.Module class NOT FOUND — PyTorch dependency not on classpath. " +
+                        "Check that 'org.pytorch:pytorch_android:2.1.0' is in app/build.gradle dependencies.")
+                } catch (eie: ExceptionInInitializerError) {
+                    // The static initializer that loads libpytorch_jni.so threw.
+                    val cause = eie.cause
+                    pytorchProbe.putBoolean("classLoaded", false)
+                    pytorchProbe.putString("nativeLibStatus",
+                        "ExceptionInInitializerError: ${cause?.javaClass?.simpleName}: ${cause?.message}. " +
+                        "This means PyTorch's native lib (libpytorch_jni.so) could not be loaded — " +
+                        "the device ABI is likely unsupported or the .so files are missing from the APK.")
                 } catch (t: Throwable) {
                     pytorchProbe.putBoolean("classLoaded", false)
-                    pytorchProbe.putString("nativeLibStatus", "${t.javaClass.simpleName}: ${t.message}")
+                    pytorchProbe.putString("nativeLibStatus",
+                        "${t.javaClass.simpleName}: ${t.message}")
                 }
                 result.putMap("pytorchProbe", pytorchProbe)
 

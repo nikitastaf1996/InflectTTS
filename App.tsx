@@ -233,11 +233,13 @@ const App: React.FC = () => {
     }
   }, [addLog, updateMetrics]);
 
-  // Run native getDiagnostics() and dump the result to the log panel.
-  // Useful when the model fails to load — shows per-file sizes, which
-  // modules loaded, and whether the PyTorch native lib is available.
+  // Run native getDiagnostics() and dump the result to the log panel
+  // AND show it as a copyable Alert so the user can paste it back to
+  // the developer. This is the primary debugging tool when the model
+  // fails to load and the user has no logcat access.
   const runDiagnostics = useCallback(async () => {
-    const { InflectTTS } = (await import('react-native')).NativeModules;
+    const RN = await import('react-native');
+    const { InflectTTS } = RN.NativeModules;
     if (!InflectTTS || !InflectTTS.getDiagnostics) {
       addLog('error', '❌ getDiagnostics() not available on this platform');
       return;
@@ -245,12 +247,67 @@ const App: React.FC = () => {
     addLog('info', '🔎 Running diagnostics…');
     try {
       const diag: any = await InflectTTS.getDiagnostics();
+
+      // ---- Build a single text blob for the Alert + clipboard ----
+      const lines: string[] = [];
+      lines.push('=== InflectTTS Diagnostics ===');
+      lines.push(`isInitialized: ${diag.isInitialized}`);
+      lines.push(`realModelReady: ${diag.realModelReady}`);
+      lines.push(`loadTime: ${diag.loadTime} ms`);
+      lines.push(`modelDir: ${diag.modelDir}`);
+      lines.push(`modelDirExists: ${diag.modelDirExists}`);
+      lines.push('');
+      lines.push('--- Load Failure ---');
+      if (diag.loadFailureReason) {
+        lines.push(`loadFailureReason:`);
+        // Indent multi-line reasons for readability
+        diag.loadFailureReason.split('\n').forEach((l: string) => lines.push(`  ${l}`));
+      } else {
+        lines.push('loadFailureReason: (none — model loaded successfully or not yet attempted)');
+      }
+      if (diag.loadFailureStacktrace) {
+        lines.push('');
+        lines.push('loadFailureStacktrace (first 30 lines):');
+        diag.loadFailureStacktrace.split('\n').slice(0, 30).forEach((l: string) => lines.push(`  ${l}`));
+      }
+      lines.push('');
+      lines.push('--- Files ---');
+      if (diag.files && Array.isArray(diag.files)) {
+        diag.files.forEach((f: any) => {
+          const sizeOk = f.sizeMatches ? '✓' : '✗';
+          const actualKB = f.actualSize >= 0 ? `${(f.actualSize / 1024).toFixed(0)} KB` : 'MISSING';
+          const expectedKB = `${(f.expectedSize / 1024).toFixed(0)} KB`;
+          lines.push(`  ${sizeOk} ${f.name}: ${actualKB} / ${expectedKB}`);
+        });
+      }
+      lines.push('');
+      lines.push('--- PyTorch Native Lib Probe ---');
+      if (diag.pytorchProbe) {
+        lines.push(`  classLoaded: ${diag.pytorchProbe.classLoaded}`);
+        lines.push(`  nativeLibProbed: ${diag.pytorchProbe.nativeLibProbed}`);
+        lines.push(`  nativeLibStatus: ${diag.pytorchProbe.nativeLibStatus}`);
+      }
+      lines.push('');
+      lines.push('--- Inference Modules ---');
+      if (diag.inference) {
+        lines.push(`  isLoaded: ${diag.inference.isLoaded}`);
+        lines.push(`  isReady: ${diag.inference.isReady}`);
+        const m = diag.inference.modulesLoaded || {};
+        lines.push(`  encP=${m.encP} dec=${m.dec} encQ=${m.encQ} flow=${m.flow} dp=${m.dp}`);
+      }
+      lines.push('');
+      lines.push('=== End Diagnostics ===');
+      const blob = lines.join('\n');
+
+      // ---- Also log to the panel (truncated for readability) ----
       addLog('info', `   isInitialized: ${diag.isInitialized}`);
       addLog('info', `   realModelReady: ${diag.realModelReady}`);
       addLog('info', `   modelDir: ${diag.modelDir}`);
       addLog('info', `   modelDirExists: ${diag.modelDirExists}`);
       if (diag.loadFailureReason) {
-        addLog('error', `   loadFailureReason: ${diag.loadFailureReason}`);
+        addLog('error', `   ⚠️  loadFailureReason: ${diag.loadFailureReason}`);
+      } else {
+        addLog('success', `   loadFailureReason: (none)`);
       }
       if (diag.files && Array.isArray(diag.files)) {
         addLog('info', `   Files:`);
@@ -272,9 +329,35 @@ const App: React.FC = () => {
         const m = diag.inference.modulesLoaded || {};
         addLog('info', `     encP=${m.encP} dec=${m.dec} encQ=${m.encQ} flow=${m.flow} dp=${m.dp}`);
       }
-      addLog('success', '✅ Diagnostics complete — see logcat for full details');
+      addLog('success', '✅ Diagnostics complete — see Alert for full output');
+
+      // ---- Show as Alert with Copy button ----
+      Alert.alert(
+        'Diagnostics Output',
+        blob,
+        [
+          {
+            text: 'Copy to Clipboard',
+            onPress: () => {
+              // Clipboard.setString may not be available without the
+              // @react-native-clipboard/clipboard dep, so use the
+              // built-in Share API as a fallback.
+              try {
+                const { Share } = RN;
+                Share.share({ message: blob, title: 'InflectTTS Diagnostics' })
+                  .then(() => addLog('success', '📋 Diagnostics shared/copied'))
+                  .catch((e: any) => addLog('error', `❌ Share failed: ${e?.message || e}`));
+              } catch (e: any) {
+                addLog('error', `❌ Copy failed: ${e?.message || e}`);
+              }
+            },
+          },
+          { text: 'Close', style: 'default' as const },
+        ],
+      );
     } catch (error: any) {
       addLog('error', `❌ Diagnostics failed: ${error?.message || error}`);
+      Alert.alert('Diagnostics Failed', `${error?.message || error}`);
     }
   }, [addLog]);
 

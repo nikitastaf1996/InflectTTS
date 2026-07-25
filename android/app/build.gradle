@@ -82,8 +82,8 @@ android {
         applicationId "com.inflecttts"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 4
-        versionName "2.1.1"
+        versionCode 5
+        versionName "2.1.2"
     }
 
     // PyTorch Android (transitively) and React Native both ship
