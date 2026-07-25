@@ -423,27 +423,45 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
             return
         }
 
+        // Increment the attempt counter IMMEDIATELY (before scope.launch)
+        // so we can detect crashes that happen during coroutine startup.
+        inferenceAttempts += 1
+        inference.lastInferenceStep = "synthesize_called"
+        inference.lastInferenceInputs = "text.len=${text.length}, speed=$speed, " +
+            "variation=$variation, seed=$seed"
+        Log.i(TAG, "synthesize() called — attempt #$inferenceAttempts, " +
+            "text='${text.take(40)}…', speed=$speed, variation=$variation, seed=$seed")
+
         scope.launch {
             val results = Arguments.createArray()
             val timings = Arguments.createMap()
-            inferenceAttempts += 1  // track attempts for diagnostics
 
             try {
+                // Mark that we entered the coroutine. If the app crashes
+                // before this line, the issue is in scope.launch startup
+                // (Dispatchers.Default thread pool).
+                inference.lastInferenceStep = "coroutine_entered"
+                Log.i(TAG, "step=coroutine_entered: synthesize coroutine running")
+
                 val totalStart = System.nanoTime()
 
                 // Step 1: Text preprocessing
+                inference.lastInferenceStep = "preprocessing"
                 val preprocessStart = System.nanoTime()
                 val normalized = text.lowercase().trim()
                     .replace(Regex("[^a-z0-9 .!?,;:]"), "")
                     .replace(Regex("\\s+"), " ")
                 val preprocessTime = (System.nanoTime() - preprocessStart) / 1_000_000.0
                 timings.putDouble("preprocessing", preprocessTime)
+                Log.i(TAG, "step=preprocessing: OK — normalized='${normalized.take(40)}…'")
 
                 // Step 2: Text to phonemes
+                inference.lastInferenceStep = "phoneme_encoding"
                 val phonemeStart = System.nanoTime()
                 val phonemes = textToPhonemes(normalized)
                 val phonemeTime = (System.nanoTime() - phonemeStart) / 1_000_000.0
                 timings.putDouble("phonemeEncoding", phonemeTime)
+                Log.i(TAG, "step=phoneme_encoding: OK — ${phonemes.size} phonemes")
 
                 // -------- Real inference (only path) --------
                 val synthStart = System.nanoTime()
@@ -478,6 +496,7 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
 
                 // Post-process: just peak-normalize — speed is already
                 // applied via lengthScale inside the inference pipeline.
+                inference.lastInferenceStep = "post_processing"
                 val postStart = System.nanoTime()
                 val processedWaveform = postProcess(raw, 1.0f)
                 val postTime = (System.nanoTime() - postStart) / 1_000_000.0
@@ -503,9 +522,17 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                     putString("description", "Peak normalization")
                 })
 
+                inference.lastInferenceStep = "save_wav"
+                Log.i(TAG, "step=save_wav: saving ${processedWaveform.size} samples to WAV")
                 val outputPath = saveWavFile(processedWaveform)
-                playAudio(processedWaveform)
+                Log.i(TAG, "step=save_wav: OK — $outputPath")
 
+                inference.lastInferenceStep = "play_audio"
+                Log.i(TAG, "step=play_audio: starting playback")
+                playAudio(processedWaveform)
+                Log.i(TAG, "step=play_audio: OK (async)")
+
+                inference.lastInferenceStep = "resolve_promise"
                 withContext(Dispatchers.Main) {
                     promise.resolve(Arguments.createMap().apply {
                         putArray("timings", results)
@@ -517,10 +544,14 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         putString("engine", "pytorch_submodules")
                     })
                 }
+                inference.lastInferenceStep = "done"
                 Log.d(TAG, "Inference complete: ${totalTime.toInt()}ms")
 
             } catch (e: Exception) {
-                Log.e(TAG, "Synthesis failed", e)
+                Log.e(TAG, "Synthesis failed at step=${inference.lastInferenceStep}", e)
+                lastInferenceError = "Synthesis failed at step=${inference.lastInferenceStep}: " +
+                    buildFailureReason(e)
+                lastInferenceErrorStacktrace = stackTraceToString(e)
                 withContext(Dispatchers.Main) {
                     promise.reject("SYNTHESIS_ERROR", e.message, e)
                 }
