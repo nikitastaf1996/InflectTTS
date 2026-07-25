@@ -1,6 +1,6 @@
 /**
  * TTS Bridge - Native Module Interface
- * 
+ *
  * This module provides the TypeScript interface to the native Android TTS module.
  */
 
@@ -13,6 +13,16 @@ export interface TTSInitResult {
   model: string;
   parameters: number;
   sampleRate: number;
+  /** True iff the real PyTorch submodules loaded successfully. */
+  realModelReady?: boolean;
+  /** Human-readable reason if the model failed to load (null on success). */
+  loadFailureReason?: string | null;
+  /** Full stack trace if the model failed to load (null on success). */
+  loadFailureStacktrace?: string | null;
+  /** Which inference engine is active: 'pytorch_submodules' | 'none'. */
+  engine?: string;
+  /** Model source URL (HuggingFace repo). */
+  modelSource?: string;
 }
 
 export interface TTSTiming {
@@ -28,6 +38,7 @@ export interface TTSSynthesisResult {
   sampleRate: number;
   audioLength: number;
   audioDuration: number;
+  engine?: string;
 }
 
 export interface TTSModelInfo {
@@ -39,18 +50,31 @@ export interface TTSModelInfo {
   outputFormat: string;
   isLoaded: boolean;
   loadTime: number;
+  /** True iff the real PyTorch submodules loaded successfully. */
+  realModelReady?: boolean;
+  /** Human-readable reason if the model failed to load (null on success). */
+  loadFailureReason?: string | null;
+  /** Full stack trace if the model failed to load (null on success). */
+  loadFailureStacktrace?: string | null;
+  /** Which inference engine is active: 'pytorch_submodules' | 'none'. */
+  engine?: string;
+  /** Model source URL (HuggingFace repo). */
+  modelSource?: string;
 }
 
-// Native module interface
+// Native module interface — returns the full payload from Kotlin, which
+// includes more fields than the typed interfaces above (we cast as needed).
 interface TTSNativeModule {
-  initializeModel(): Promise<TTSInitResult>;
+  initializeModel(): Promise<any>;
   synthesize(
     text: string,
     speed: number,
     variation: number,
     seed: number
-  ): Promise<TTSSynthesisResult>;
-  getModelInfo(): Promise<TTSModelInfo>;
+  ): Promise<any>;
+  getModelInfo(): Promise<any>;
+  getDiagnostics(): Promise<any>;
+  redownloadModel(): Promise<boolean>;
 }
 
 // Get native module
@@ -66,44 +90,50 @@ if (Platform.OS === 'android' && !InflectTTS) {
 
 /**
  * TTS Bridge class
- * 
+ *
  * Provides a unified interface for TTS synthesis, with fallback to
- * JavaScript simulation when native module is unavailable.
+ * JavaScript simulation when native module is unavailable (e.g. iOS).
+ *
+ * IMPORTANT: the cached `modelInfo` MUST include realModelReady,
+ * loadFailureReason, and loadFailureStacktrace — otherwise App.tsx
+ * can't tell whether the real model loaded, and shows a spurious
+ * "no reason captured — this is a bug" message even when the model
+ * loaded successfully.
  */
 class TTSBridge {
   private isInitialized: boolean = false;
   private modelInfo: TTSModelInfo | null = null;
 
   /**
-   * Initialize the TTS model
+   * Initialize the TTS model. Always calls the native initializeModel()
+   * (no early return) so the JS side gets fresh realModelReady /
+   * loadFailureReason values every time.
    */
   async initialize(): Promise<TTSInitResult> {
-    if (this.isInitialized) {
-      return {
-        success: true,
-        loadTime: this.modelInfo?.loadTime || 0,
-        model: this.modelInfo?.name || 'Inflect-Nano-v2',
-        parameters: this.modelInfo?.parameters || 3966721,
-        sampleRate: this.modelInfo?.sampleRate || 24000,
-      };
-    }
-
     try {
       if (Platform.OS === 'android' && InflectTTS) {
         const result = await (InflectTTS as TTSNativeModule).initializeModel();
-        this.isInitialized = result.success;
-        if (result.success) {
-          this.modelInfo = {
-            name: result.model,
-            version: '2.0',
-            parameters: result.parameters,
-            size: '15.97 MB',
-            sampleRate: result.sampleRate,
-            outputFormat: '24 kHz mono WAV',
-            isLoaded: true,
-            loadTime: result.loadTime,
-          };
-        }
+        this.isInitialized = result.success === true;
+        // Cache the FULL native payload — including realModelReady,
+        // loadFailureReason, loadFailureStacktrace — so getModelInfo()
+        // returns them too. The previous version dropped these fields,
+        // which caused App.tsx to see realModelReady=undefined and show
+        // a spurious "no reason captured" error.
+        this.modelInfo = {
+          name: result.model,
+          version: '2.1',
+          parameters: result.parameters,
+          size: '15.97 MB',
+          sampleRate: result.sampleRate,
+          outputFormat: '24 kHz mono WAV',
+          isLoaded: result.success === true,
+          loadTime: result.loadTime,
+          realModelReady: result.realModelReady,
+          loadFailureReason: result.loadFailureReason,
+          loadFailureStacktrace: result.loadFailureStacktrace,
+          engine: result.engine,
+          modelSource: result.modelSource,
+        };
         return result;
       } else {
         // Simulate initialization for iOS or when native module is unavailable
@@ -111,13 +141,16 @@ class TTSBridge {
         this.isInitialized = true;
         this.modelInfo = {
           name: 'Inflect-Nano-v2',
-          version: '2.0',
+          version: '2.1',
           parameters: 3966721,
           size: '15.97 MB',
           sampleRate: 24000,
           outputFormat: '24 kHz mono WAV',
           isLoaded: true,
           loadTime: 1500,
+          realModelReady: false,
+          loadFailureReason: 'Native module unavailable on this platform (iOS/dev mode).',
+          engine: 'none',
         };
         return {
           success: true,
@@ -125,6 +158,7 @@ class TTSBridge {
           model: 'Inflect-Nano-v2',
           parameters: 3966721,
           sampleRate: 24000,
+          realModelReady: false,
         };
       }
     } catch (error) {
@@ -134,7 +168,7 @@ class TTSBridge {
   }
 
   /**
-   * Run TTS synthesis
+   * Run TTS synthesis.
    */
   async synthesize(
     text: string,
@@ -169,55 +203,76 @@ class TTSBridge {
   }
 
   /**
-   * Get model information
+   * Get model information. ALWAYS re-fetches from native (no cache) so
+   * the JS side sees fresh realModelReady / loadFailureReason values.
+   * The previous version cached the result and dropped the new fields.
    */
   async getModelInfo(): Promise<TTSModelInfo> {
-    if (this.modelInfo) {
-      return this.modelInfo;
-    }
-
     try {
       if (Platform.OS === 'android' && InflectTTS) {
         const info = await (InflectTTS as TTSNativeModule).getModelInfo();
-        this.modelInfo = info;
-        return info;
-      } else {
+        // Cache the full native payload.
         this.modelInfo = {
-          name: 'Inflect-Nano-v2',
-          version: '2.0',
-          parameters: 3966721,
-          size: '15.97 MB',
-          sampleRate: 24000,
-          outputFormat: '24 kHz mono WAV',
-          isLoaded: this.isInitialized,
-          loadTime: 1500,
+          name: info.name,
+          version: info.version,
+          parameters: info.parameters,
+          size: info.size,
+          sampleRate: info.sampleRate,
+          outputFormat: info.outputFormat,
+          isLoaded: info.isLoaded,
+          loadTime: info.loadTime,
+          realModelReady: info.realModelReady,
+          loadFailureReason: info.loadFailureReason,
+          loadFailureStacktrace: info.loadFailureStacktrace,
+          engine: info.engine,
+          modelSource: info.modelSource,
         };
+        return this.modelInfo;
+      } else {
+        if (!this.modelInfo) {
+          this.modelInfo = {
+            name: 'Inflect-Nano-v2',
+            version: '2.1',
+            parameters: 3966721,
+            size: '15.97 MB',
+            sampleRate: 24000,
+            outputFormat: '24 kHz mono WAV',
+            isLoaded: this.isInitialized,
+            loadTime: 1500,
+            realModelReady: false,
+            loadFailureReason: 'Native module unavailable on this platform.',
+            engine: 'none',
+          };
+        }
         return this.modelInfo;
       }
     } catch (error) {
       console.error('Failed to get model info:', error);
       return {
         name: 'Inflect-Nano-v2',
-        version: '2.0',
+        version: '2.1',
         parameters: 3966721,
         size: '15.97 MB',
         sampleRate: 24000,
         outputFormat: '24 kHz mono WAV',
         isLoaded: false,
         loadTime: 0,
+        realModelReady: false,
+        loadFailureReason: `getModelInfo() failed: ${error}`,
+        engine: 'none',
       };
     }
   }
 
   /**
-   * Check if TTS is initialized
+   * Check if TTS is initialized.
    */
   isReady(): boolean {
     return this.isInitialized;
   }
 
   /**
-   * Simulate synthesis for development/testing
+   * Simulate synthesis for development/testing (non-Android only).
    */
   private async simulateSynthesis(
     text: string,
@@ -247,6 +302,7 @@ class TTSBridge {
       sampleRate: 24000,
       audioLength: Math.round(audioDuration * 24000),
       audioDuration,
+      engine: 'simulation',
     };
   }
 

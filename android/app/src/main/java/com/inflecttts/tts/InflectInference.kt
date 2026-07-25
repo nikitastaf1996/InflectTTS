@@ -74,6 +74,24 @@ class InflectInference(private val context: Context) {
     fun isReady(): Boolean = isLoaded
 
     /**
+     * The name of the inference step currently being executed (or the last
+     * one attempted if a crash killed the process). @Volatile so it's
+     * visible from the JS thread when [TTSModule.getDiagnostics] is called.
+     *
+     * Values: "init", "prepare_tokens", "enc_p_forward", "dp_forward",
+     * "compute_durations", "build_attention", "expand_m_p", "sample_z_p",
+     * "flow_forward", "dec_forward", "done".
+     */
+    @Volatile
+    var lastInferenceStep: String = "init"
+        private set
+
+    /** Inputs used for the last inference (for crash post-mortem). */
+    @Volatile
+    var lastInferenceInputs: String = ""
+        private set
+
+    /**
      * Load all five `.pt` submodules. Throws on any failure with a
      * message that identifies WHICH file failed — so the user can
      * tell whether (e.g.) `inflect_dec.pt` is corrupted vs.
@@ -179,6 +197,10 @@ class InflectInference(private val context: Context) {
         m.putBoolean("isReady", isReady())
         m.putString("modelDir", modelDir.absolutePath)
         m.putBoolean("modelDirExists", modelDir.exists())
+        // Crash post-mortem fields — these survive a process crash because
+        // they're @Volatile and written before each native call.
+        m.putString("lastInferenceStep", lastInferenceStep)
+        m.putString("lastInferenceInputs", lastInferenceInputs)
         val modules = com.facebook.react.bridge.Arguments.createMap()
         modules.putBoolean("encP", encP != null)
         modules.putBoolean("dec",  dec  != null)
@@ -205,6 +227,12 @@ class InflectInference(private val context: Context) {
     /**
      * Run the full inference pipeline.
      *
+     * Each native call is preceded by setting [lastInferenceStep] — a
+     * @Volatile field that survives a process crash. So if a native
+     * SIGSEGV kills the app during (e.g.) `flow_forward`, the next
+     * launch's getDiagnostics() will report `lastInferenceStep = "flow_forward"`,
+     * telling us exactly which call crashed.
+     *
      * @param phonemes token IDs in the model's symbol table (1-indexed phonemes;
      *                  0 is reserved for blank/pad).
      * @param noiseScale variation in latent sampling (0..1+).
@@ -220,23 +248,36 @@ class InflectInference(private val context: Context) {
     ): FloatArray {
         check(isLoaded) { "InflectInference not loaded — call load() first" }
 
+        // Record inputs for crash post-mortem.
+        lastInferenceInputs = "phonemes.size=${phonemes.size}, " +
+            "noiseScale=$noiseScale, lengthScale=$lengthScale, noiseScaleW=$noiseScaleW"
+        Log.i(TAG, "infer() START — $lastInferenceInputs")
+
         // -------- 0. Prepare token tensor [1, MAX_SEQ_LEN] (int64) --------
-        // PyTorch Android 2.1.0 exposes `Tensor.fromBlob(long[], long[])` (no `fromBlobLong`).
+        lastInferenceStep = "prepare_tokens"
+        Log.i(TAG, "step=$lastInferenceStep: building tokens tensor [1, $MAX_SEQ_LEN]")
         val seq = IntArray(MAX_SEQ_LEN) { 0 }
         val realLen = min(phonemes.size, MAX_SEQ_LEN)
         System.arraycopy(phonemes, 0, seq, 0, realLen)
         val seqLong = LongArray(MAX_SEQ_LEN) { i -> seq[i].toLong() }
         val tokensTensor = Tensor.fromBlob(seqLong, longArrayOf(1, MAX_SEQ_LEN.toLong()))
         val lengthsTensor = Tensor.fromBlob(longArrayOf(realLen.toLong()), longArrayOf(1))
+        Log.i(TAG, "step=$lastInferenceStep: tokens shape=${tokensTensor.shape().contentToString()}, " +
+            "lengths shape=${lengthsTensor.shape().contentToString()}, realLen=$realLen")
 
         // -------- 1. enc_p.forward(tokens, lengths) -> (x, m_p, logs_p, x_mask) --------
+        lastInferenceStep = "enc_p_forward"
+        Log.i(TAG, "step=$lastInferenceStep: calling encP.forward(tokens, lengths)")
         val encOut = encP!!.forward(IValue.from(tokensTensor), IValue.from(lengthsTensor)).toTuple()
         val xTensor = encOut[0].toTensor()       // [1, hidden, T_text]
         val mPTensor = encOut[1].toTensor()      // [1, inter, T_text]
         val logsPTensor = encOut[2].toTensor()   // [1, inter, T_text]
         val xMaskTensor = encOut[3].toTensor()   // [1, 1, T_text]
-        Log.d(TAG, "enc_p: x=${xTensor.shape().contentToString()}, m_p=${mPTensor.shape().contentToString()}, " +
-            "logs_p=${logsPTensor.shape().contentToString()}, x_mask=${xMaskTensor.shape().contentToString()}")
+        Log.i(TAG, "step=$lastInferenceStep: OK — " +
+            "x=${xTensor.shape().contentToString()}, " +
+            "m_p=${mPTensor.shape().contentToString()}, " +
+            "logs_p=${logsPTensor.shape().contentToString()}, " +
+            "x_mask=${xMaskTensor.shape().contentToString()}")
 
         // -------- 2. dp.forward(x, x_mask[, reverse, noise_scale]) --------
         // With `use_sdp=false` (see config.json), `dp` is a deterministic
@@ -246,13 +287,16 @@ class InflectInference(private val context: Context) {
         // forward is `forward(x, x_mask, reverse, noise_scale)`.
         // We try the deterministic signature first (matches our config),
         // then fall back to the stochastic one.
+        lastInferenceStep = "dp_forward"
+        Log.i(TAG, "step=$lastInferenceStep: calling dp.forward(x, x_mask) [deterministic]")
         val logw: Tensor = try {
             dp!!.forward(
                 IValue.from(xTensor),
                 IValue.from(xMaskTensor),
             ).toTensor()
         } catch (t1: Throwable) {
-            Log.w(TAG, "dp.forward(x, x_mask) failed (${t1.message}); trying stochastic signature")
+            Log.w(TAG, "step=$lastInferenceStep: deterministic failed (${t1.message}); " +
+                "trying stochastic signature dp.forward(x, x_mask, reverse=true, noise_scale=$noiseScaleW)")
             dp!!.forward(
                 IValue.from(xTensor),
                 IValue.from(xMaskTensor),
@@ -260,12 +304,12 @@ class InflectInference(private val context: Context) {
                 IValue.from(noiseScaleW.toDouble()),
             ).toTensor()
         }
-        Log.d(TAG, "dp: logw=${logw.shape().contentToString()}")
+        Log.i(TAG, "step=$lastInferenceStep: OK — logw=${logw.shape().contentToString()}")
 
         // -------- 3. Compute durations and y_lengths --------
-        // w = exp(logw) * x_mask * length_scale
-        // w_ceil = ceil(w)
-        // y_lengths = clamp(sum(w_ceil), 1)
+        // Pure Kotlin — no native calls, can't crash.
+        lastInferenceStep = "compute_durations"
+        Log.i(TAG, "step=$lastInferenceStep: computing durations from logw")
         val logwArr = logw.getDataAsFloatArray()
         val xMaskArr = xMaskTensor.getDataAsFloatArray()
         val tText = (xMaskTensor.shape()[2]).toInt()
@@ -281,16 +325,13 @@ class InflectInference(private val context: Context) {
             yLenSum += c
         }
         val yLengths = max(yLenSum, 1L).toInt()
-        Log.d(TAG, "y_lengths=$yLengths (sum of $tText durations)")
+        Log.i(TAG, "step=$lastInferenceStep: OK — y_lengths=$yLengths " +
+            "(sum of $tText durations, lengthScale=$lengthScale)")
 
-        // -------- 4. Build y_mask, attn_mask, attn --------
-        // y_mask = sequence_mask(y_lengths, y_lengths).unsqueeze(1)  -> [1, 1, y_len]
-        val yMask = FloatArray(yLengths) { 1f }  // [y_len]
-        // attn_mask[i, j] = x_mask[i] * y_mask[j]  (broadcasting)
-        // attn[t_text, t_y] = 1 if (t_text valid) and (t_y < y_lengths)
-
-        // generate_path: produces alignment [t_y, t_text] where attn[t_y, t_text] = 1
-        // if t_y falls within the duration span of phoneme t_text.
+        // -------- 4. Build attention matrix --------
+        // Pure Kotlin.
+        lastInferenceStep = "build_attention"
+        Log.i(TAG, "step=$lastInferenceStep: building attention matrix [$yLengths x $tText]")
         val attn = Array(yLengths) { FloatArray(tText) }  // [t_y, t_text]
         var pos = 0
         for (t in 0 until tText) {
@@ -302,13 +343,17 @@ class InflectInference(private val context: Context) {
                 }
             }
         }
+        Log.i(TAG, "step=$lastInferenceStep: OK")
 
         // -------- 5. Expand m_p, logs_p along time via attn --------
-        // m_p_expanded[1, inter, t_y] = sum_t(attn[t_y, t] * m_p[1, inter, t])
-        // We do this in Kotlin because matmul via Tensor is awkward here.
-        val mPArr = mPTensor.getDataAsFloatArray()   // [1, inter, t_text] flattened row-major
+        // Pure Kotlin.
+        lastInferenceStep = "expand_m_p"
+        Log.i(TAG, "step=$lastInferenceStep: expanding m_p and logs_p via attention")
+        val mPArr = mPTensor.getDataAsFloatArray()
         val logsPArr = logsPTensor.getDataAsFloatArray()
         val inter = (mPTensor.shape()[1]).toInt()
+        Log.i(TAG, "step=$lastInferenceStep: inter=$inter, yLengths=$yLengths, " +
+            "mPExp size=${inter * yLengths}")
         val mPExp = FloatArray(inter * yLengths)
         val logsPExp = FloatArray(inter * yLengths)
         for (c in 0 until inter) {
@@ -325,38 +370,44 @@ class InflectInference(private val context: Context) {
                 logsPExp[c * yLengths + y] = accL
             }
         }
+        Log.i(TAG, "step=$lastInferenceStep: OK")
 
-        // z_p = m_p + randn_like(m_p) * exp(logs_p) * noise_scale
-        // Use java.util.Random for nextGaussian() — Kotlin's Random doesn't
-        // expose nextGaussian() in older stdlib versions and may need
-        // ExperimentalStdlibApi opt-in.
+        // -------- 5b. Sample z_p = m_p + randn * exp(logs_p) * noise_scale --------
+        // Pure Kotlin.
+        lastInferenceStep = "sample_z_p"
+        Log.i(TAG, "step=$lastInferenceStep: sampling z_p (Gaussian)")
         val rand = java.util.Random(System.nanoTime())
         val zP = FloatArray(inter * yLengths)
         for (i in zP.indices) {
             val r = rand.nextGaussian().toFloat()
             zP[i] = mPExp[i] + r * exp(logsPExp[i].toDouble()).toFloat() * noiseScale
         }
+        Log.i(TAG, "step=$lastInferenceStep: OK — zP size=${zP.size}")
 
         // -------- 6. flow.forward(z_p, y_mask, reverse=True) -> z --------
+        lastInferenceStep = "flow_forward"
         val zPTensor = Tensor.fromBlob(zP, longArrayOf(1, inter.toLong(), yLengths.toLong()))
         val yMaskT = Tensor.fromBlob(
             FloatArray(yLengths) { 1f },
             longArrayOf(1, 1, yLengths.toLong()),
         )
+        Log.i(TAG, "step=$lastInferenceStep: calling flow.forward(z_p=${zPTensor.shape().contentToString()}, " +
+            "y_mask=${yMaskT.shape().contentToString()}, reverse=true)")
         val zTensor = flow!!.forward(
             IValue.from(zPTensor),
             IValue.from(yMaskT),
             IValue.from(true),
         ).toTensor()
-        Log.d(TAG, "flow: z=${zTensor.shape().contentToString()}")
-
-        // z * y_mask (y_mask already 1.0 in valid region)
-        val zArr = zTensor.getDataAsFloatArray()
+        Log.i(TAG, "step=$lastInferenceStep: OK — z=${zTensor.shape().contentToString()}")
 
         // -------- 7. dec.forward(z * y_mask) -> waveform --------
+        lastInferenceStep = "dec_forward"
+        Log.i(TAG, "step=$lastInferenceStep: calling dec.forward(z=${zTensor.shape().contentToString()})")
         val outTensor = dec!!.forward(IValue.from(zTensor)).toTensor()
-        Log.d(TAG, "dec: out=${outTensor.shape().contentToString()}")
+        Log.i(TAG, "step=$lastInferenceStep: OK — out=${outTensor.shape().contentToString()}")
 
+        lastInferenceStep = "done"
+        Log.i(TAG, "infer() DONE — returning ${outTensor.getDataAsFloatArray().size} samples")
         return outTensor.getDataAsFloatArray()
     }
 }

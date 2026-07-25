@@ -182,7 +182,8 @@ const App: React.FC = () => {
       // first run, then loads the five scripted submodules via PyTorch.
       const initResult: any = await ttsBridge.initialize();
 
-      // Get model info
+      // Get model info — ALWAYS re-fetches from native (no cache) so we
+      // get fresh realModelReady / loadFailureReason values.
       const info = await ttsBridge.getModelInfo();
       setModelInfo(info);
 
@@ -194,19 +195,23 @@ const App: React.FC = () => {
       addLog('info', `📊 Output: ${info.outputFormat}`);
       addLog('info', `📊 Model size: ${info.size}`);
       addLog('info', `📦 Source: ${(info as any).modelSource || 'huggingface'}`);
-      if ((info as any).realModelReady) {
+      // Use initResult.realModelReady as the primary source of truth (it
+      // comes straight from the native initializeModel() resolve payload).
+      // Fall back to info.realModelReady (from getModelInfo()) if needed.
+      const realReady = initResult.realModelReady ?? (info as any).realModelReady;
+      if (realReady === true) {
         addLog('success', '🧠 PyTorch submodules loaded — real Inflect v2 inference active');
       } else {
         // No fallback. Surface the exact reason and stack trace so the
         // user can debug without needing logcat access.
-        const reason = (info as any).loadFailureReason
-          || 'No failure reason captured — this is a bug. Call getDiagnostics() and check logcat.';
-        const stack: string | undefined = (info as any).loadFailureStacktrace;
+        const reason = initResult.loadFailureReason
+          || (info as any).loadFailureReason
+          || 'No failure reason captured. Call getDiagnostics() for details.';
+        const stack: string | undefined =
+          initResult.loadFailureStacktrace || (info as any).loadFailureStacktrace;
         addLog('error', `❌ Model failed to load. Synthesis is disabled.`);
         addLog('error', `   Reason: ${reason}`);
         if (stack) {
-          // Log the first ~10 lines of the stack trace so they're visible
-          // in the scrollable log panel without overwhelming it.
           const stackLines = stack.split('\n').slice(0, 12);
           addLog('error', `   Stack trace (first ${stackLines.length} lines):`);
           stackLines.forEach((line: string) => addLog('error', `     ${line}`));
@@ -274,6 +279,20 @@ const App: React.FC = () => {
         const totalLines2 = diag.lastInferenceErrorStacktrace.split('\n').length;
         if (totalLines2 > 15) {
           lines.push(`  ... (${totalLines2 - 15} more lines — full trace in logcat)`);
+        }
+      }
+      // ---- CRASH POST-MORTEM FIELDS ----
+      // If the app crashed during synthesis, these fields tell us exactly
+      // which step crashed. They survive the crash because they're @Volatile.
+      if (diag.inference) {
+        lines.push('');
+        lines.push('--- Last Inference Step (crash post-mortem) ---');
+        lines.push(`  lastInferenceStep: ${diag.inference.lastInferenceStep || '(none)'}`);
+        lines.push(`  lastInferenceInputs: ${diag.inference.lastInferenceInputs || '(none)'}`);
+        if (diag.inference.lastInferenceStep && diag.inference.lastInferenceStep !== 'done' && diag.inference.lastInferenceStep !== 'init') {
+          lines.push('');
+          lines.push(`  ⚠️  lastInferenceStep is "${diag.inference.lastInferenceStep}" (not "done").`);
+          lines.push(`  This means the app crashed during this step on the last synthesis attempt.`);
         }
       }
       lines.push('');
