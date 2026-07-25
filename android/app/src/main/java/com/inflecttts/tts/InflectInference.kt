@@ -308,41 +308,30 @@ class InflectInference(private val context: Context) {
             "logs_p=${logsPTensor.shape().contentToString()}, " +
             "x_mask=${xMaskTensor.shape().contentToString()}")
 
-        // -------- 2. dp.forward(x, x_mask[, reverse, noise_scale]) --------
-        // Per the HF README, the scripted dp.forward signature is:
-        //   dp.forward(x, x_mask, reverse=True, noise_scale=noise_scale_w) -> logw
-        // (4 args — StochasticDurationPredictor signature).
+        // -------- 2. dp.forward(x, x_mask) -> logw --------
+        // CRITICAL: config.json has `use_sdp: false`, which means `dp` is
+        // a DETERMINISTIC DurationPredictor (NOT a StochasticDurationPredictor).
+        // Its scripted forward signature is:
+        //   dp.forward(x, x_mask) -> logw        (2 args, deterministic)
         //
-        // With `use_sdp=false` (see config.json), `dp` MIGHT be a
-        // deterministic `DurationPredictor` whose scripted forward is
-        // `forward(x, x_mask)` (2 args). But the README's reconstruction
-        // steps use the 4-arg form, so we try that FIRST. If the 4-arg
-        // call throws (not crashes — a clean Java exception), we fall
-        // back to the 2-arg form.
+        // The HF README's reconstruction step 2 mentions a 4-arg form
+        //   dp.forward(x, x_mask, reverse=True, noise_scale=noise_scale_w)
+        // but that only applies when use_sdp=true (StochasticDurationPredictor).
+        // For our config (use_sdp=false), calling dp with 4 args triggers a
+        // native SIGSEGV — TorchScript's native dispatch crashes before the
+        // arg-count check can throw a clean Java exception.
         //
-        // IMPORTANT: we must try the form the README specifies FIRST.
-        // The previous version tried 2 args first, but if the scripted
-        // module actually expects 4 args, the 2-arg call can trigger a
-        // native SIGSEGV (process crash) instead of a clean exception —
-        // and we'd never reach the fallback.
+        // v2.2.1 tried the 4-arg form first and crashed at dp_forward.
+        // v2.3.1 uses the 2-arg form directly (matches use_sdp=false).
+        // The noiseScaleW parameter is simply ignored — deterministic
+        // DurationPredictor doesn't use noise.
         lastInferenceStep = "dp_forward"
-        Log.i(TAG, "step=$lastInferenceStep: calling dp.forward(x, x_mask, reverse=true, " +
-            "noise_scale=$noiseScaleW) [4-arg stochastic, per HF README]")
-        val logw: Tensor = try {
-            dp!!.forward(
-                IValue.from(xTensor),
-                IValue.from(xMaskTensor),
-                IValue.from(true),
-                IValue.from(noiseScaleW.toDouble()),
-            ).toTensor()
-        } catch (t1: Throwable) {
-            Log.w(TAG, "step=$lastInferenceStep: 4-arg stochastic failed (${t1.message}); " +
-                "trying 2-arg deterministic signature dp.forward(x, x_mask)")
-            dp!!.forward(
-                IValue.from(xTensor),
-                IValue.from(xMaskTensor),
-            ).toTensor()
-        }
+        Log.i(TAG, "step=$lastInferenceStep: calling dp.forward(x=${xTensor.shape().contentToString()}, " +
+            "x_mask=${xMaskTensor.shape().contentToString()}) [2-arg deterministic, use_sdp=false]")
+        val logw: Tensor = dp!!.forward(
+            IValue.from(xTensor),
+            IValue.from(xMaskTensor),
+        ).toTensor()
         Log.i(TAG, "step=$lastInferenceStep: OK — logw=${logw.shape().contentToString()}")
 
         // -------- 3. Compute durations and y_lengths --------
