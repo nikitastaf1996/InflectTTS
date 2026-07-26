@@ -1,8 +1,0 @@
-{
-  "model_name": "Inflect-Nano-v2",
-  "parameters": 3966721,
-  "model_size_mb": 15.97,
-  "sample_rate": 24000,
-  "output_channels": 1,
-  "quantization": "none"
-}

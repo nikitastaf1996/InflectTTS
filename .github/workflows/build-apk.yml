@@ -22,13 +22,10 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # Initialize the HF submodule. We don't need LFS because
-          # the app downloads the real .pt files at runtime — only
-          # the pointer + README files are useful in CI for documentation.
-          submodules: recursive
+        # No submodules — the app downloads .onnx files from HuggingFace
+        # at runtime. No git-lfs needed either.
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -179,25 +176,29 @@ jobs:
 
             ### What's inside
             - React Native 0.86 + Hermes + New Architecture
-            - PyTorch Android 2.1.0 for on-device TorchScript inference
-            - HuggingFace submodule `nikitastaf1996/Inflect-Nano-v2-TorchScript`
-              pinned at `models/Inflect-Nano-v2-TorchScript/` (source reference)
-            - **First-run model download**: the app fetches the five scripted
-              submodule `.pt` files (`inflect_enc_p`, `inflect_dec`,
-              `inflect_enc_q`, `inflect_flow`, `inflect_dp`, total ~20 MB)
-              from HuggingFace on first launch and caches them in app-internal
-              storage. Subsequent launches reuse the cached files.
-            - Real VITS-style inference reconstruction (enc_p → dp → flow → dec).
-              **No fallback synth** in v2.1 — if the model fails to load,
-              `synthesize()` rejects with `MODEL_NOT_LOADED` and a
-              human-readable reason (surfaced via `getModelInfo().loadFailureReason`).
+            - ONNX Runtime 1.27 + XNNPACK EP for on-device inference
+            - **First-run model download**: the app fetches 2 ONNX graphs
+              (`duration.onnx` + `decode.onnx`, total ~15.5 MB) from the
+              official `owensong/Inflect-Nano-v2-ONNX` HuggingFace repo on
+              first launch and caches them in app-internal storage.
+            - 2-graph inference pipeline (duration → decode) — attention
+              matrix, path generation, matmul, and max_len slicing are all
+              baked into the ONNX graphs. Only 2 native calls per synthesis.
+            - Rule-based English g2p (`InflectG2P.kt`) → IPA token IDs.
+            - Crash post-mortem via SharedPreferences (lastInferenceStep
+              survives process crashes).
+
+            ### Performance
+            - **Realtime factor:** 2.5x RT (measured on mid-range Snapdragon)
+            - **APK size:** 87 MB
+            - **Inference engine:** ONNX Runtime + XNNPACK EP
 
             ### Model Info
             - **Model:** Inflect-Nano-v2
             - **Parameters:** 3,966,721
-            - **Size:** ~16 MB (scripted submodules ~20 MB on disk)
-            - **Output:** 24 kHz mono WAV
-            - **Source:** `huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript`
+            - **Size:** ~16 MB (ONNX graphs ~15.5 MB on disk)
+            - **Output:** 24 kHz mono float32 PCM
+            - **Source:** `huggingface.co/owensong/Inflect-Nano-v2-ONNX`
 
             ### Build Info
             - **Commit:** [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})

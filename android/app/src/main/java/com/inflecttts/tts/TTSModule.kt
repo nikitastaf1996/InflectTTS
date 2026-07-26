@@ -21,24 +21,23 @@ import kotlin.random.Random
  *
  * Provides TTS inference for the Inflect Nano v2 model.
  *
- * Pipeline (v2.1 — submodule pathway, no fallback):
- *   1. On `initializeModel()`, [ModelDownloader] pulls the five scripted
- *      submodule `.ptl` files from the `nikitastaf1996/Inflect-Nano-v2-Mobile`
- *      HuggingFace repo into the app's internal storage (cached for reuse).
- *   2. [InflectInference] loads those `.pt` files via PyTorch Android and
- *      reconstructs the `SynthesizerTrn.infer()` pipeline locally.
+ * Pipeline (v3.0 — ONNX Runtime, no fallback):
+ *   1. On `initializeModel()`, [ModelDownloader] pulls the two ONNX graph
+ *      files (`duration.onnx`, `decode.onnx`) from the official
+ *      `owensong/Inflect-Nano-v2-ONNX` HuggingFace repo into the app's
+ *      internal storage (cached for reuse).
+ *   2. [InflectInference] loads those `.onnx` files via ONNX Runtime
+ *      and runs the 2-graph inference pipeline.
  *   3. `synthesize()` runs the real inference only. If the model failed
- *      to load (network error, corrupted file, TorchScript incompat, OOM,
+ *      to load (network error, corrupted file, ONNX incompat, OOM,
  *      …), the call rejects with `MODEL_NOT_LOADED` and a human-readable
  *      reason stored in `loadFailureReason` and surfaced via
  *      `getModelInfo()`. The legacy simplified synth was removed in v2.1
  *      — the app is either running the real Inflect v2 inference or it
  *      is erroring out with a clear message.
  *
- * The HuggingFace repo is also pinned as a git submodule at
- * `models/Inflect-Nano-v2-Mobile/` in this repository for source /
- * build reference. Runtime weights are downloaded from HF directly so
- * the APK does not bundle ~20 MB of LFS-backed binaries.
+ * The model files are downloaded from HF directly at runtime so the APK
+ * does not bundle ~15.5 MB of LFS-backed binaries.
  */
 class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 

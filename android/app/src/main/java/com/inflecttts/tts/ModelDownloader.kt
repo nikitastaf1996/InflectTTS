@@ -14,40 +14,31 @@ import kotlin.math.min
 /**
  * ModelDownloader
  *
- * Pulls the two ONNX graph files from the
- * `nikitastaf1996/Inflect-Nano-v2-Mobile` HuggingFace
- * repository into the app's internal files directory on first run.
+ * Pulls the two ONNX graph files from the official
+ * `owensong/Inflect-Nano-v2-ONNX` HuggingFace repository into the
+ * app's internal files directory on first run.
  *
- * The model is split into 2 ONNX graphs (originally from
- * owensong/Inflect-Nano-v2-ONNX, mirrored to our repo):
- *   - decode.onnx   (12.6 MB) — flow + dec (baked into one graph)
- *   - duration.onnx (3.6 MB)  — enc_p + dp + attention + expand (baked in)
+ * The model is split into 2 ONNX graphs:
+ *   - decode.onnx   (12.0 MB) — flow + dec (baked into one graph)
+ *   - duration.onnx (3.5 MB)  — enc_p + dp + attention + expand (baked in)
  *
- * The 2-graph split means only 2 native inference calls per synthesis
- * (vs 4 for the PyTorch submodule pathway), and the attention matrix,
- * path generation, and matmul expansion are all baked into duration.onnx
- * — no Kotlin orchestration needed.
+ * The 2-graph split means only 2 native inference calls per synthesis,
+ * and the attention matrix, path generation, and matmul expansion are
+ * all baked into duration.onnx — no Kotlin orchestration needed.
  *
- * The same files are also referenced as a git submodule at
- * `models/Inflect-Nano-v2-Mobile/` in the InflectTTS repo
- * (see `.gitmodules`). The submodule path is for source / build
- * reference; the actual weights are downloaded here at runtime so
- * that the APK stays small and the LFS-backed binaries are not
- * bundled.
- *
- * Total download: ~16.2 MB. Downloaded once, cached, and reused.
+ * Total download: ~15.5 MB. Downloaded once, cached, and reused.
  */
 class ModelDownloader(private val context: Context) {
 
     companion object {
         private const val TAG = "ModelDownloader"
 
-        /** HuggingFace model repository (git submodule source). */
-        const val HF_REPO = "nikitastaf1996/Inflect-Nano-v2-Mobile"
+        /** Official HuggingFace model repository (the author's ONNX export). */
+        const val HF_REPO = "owensong/Inflect-Nano-v2-ONNX"
 
-        /** Raw-file URL prefix for `resolve/main/` on HuggingFace. */
+        /** Raw-file URL prefix — files are under `onnx/` in the official repo. */
         private const val HF_BASE =
-            "https://huggingface.co/$HF_REPO/resolve/main/"
+            "https://huggingface.co/$HF_REPO/resolve/main/onnx/"
 
         /** Subdirectory under `context.filesDir` where the .onnx files live. */
         const val MODEL_DIR_NAME = "inflect_model"
@@ -57,23 +48,24 @@ class ModelDownloader(private val context: Context) {
          * Order matters for the progress callback: largest first to give the
          * user a smoother percentage.
          *
-         * The model is split into 2 ONNX graphs (from owensong/Inflect-Nano-v2-ONNX):
-         *   - decode.onnx   (12.6 MB) — flow + dec (baked into one graph)
-         *   - duration.onnx (3.6 MB)  — enc_p + dp + attention + expand (baked in)
+         * The model is split into 2 ONNX graphs:
+         *   - decode.onnx   (12.0 MB) — flow + dec (baked into one graph)
+         *   - duration.onnx (3.5 MB)  — enc_p + dp + attention + expand (baked in)
          *
-         * The 2-graph split means only 2 native inference calls per synthesis
-         * (vs 4 for the PyTorch submodule pathway), and the attention matrix,
-         * path generation, and matmul expansion are all baked into duration.onnx.
+         * The 2-graph split means only 2 native inference calls per synthesis,
+         * and the attention matrix, path generation, and matmul expansion are
+         * all baked into duration.onnx.
          *
          * Sizes are the exact byte counts (verified via sha256 checksums
-         * 2026-07-26). allPresent() uses these to detect partial downloads.
+         * 2026-07-26 against onnx/checksums.sha256). allPresent() uses these
+         * to detect partial downloads.
          */
         val MODEL_FILES: List<ModelFile> = listOf(
             ModelFile("decode.onnx",    12_570_009L),
             ModelFile("duration.onnx",   3_636_541L),
         )
 
-        /** Aggregate byte size of all submodule weights. */
+        /** Aggregate byte size of all ONNX weights. */
         val TOTAL_BYTES: Long = MODEL_FILES.sumOf { it.expectedSize }
     }
 

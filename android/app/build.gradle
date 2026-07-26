@@ -82,8 +82,8 @@ android {
         applicationId "com.inflecttts"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 22
-        versionName "3.0.1"
+        versionCode 23
+        versionName "3.1.0"
     }
 
     // (PyTorch fbjni exclude removed — we no longer use PyTorch.

@@ -1,265 +1,146 @@
-# InflectTTS - Android App for Inflect Nano v2
+# InflectTTS — On-device Text-to-Speech for Android
 
 <p align="center">
-  <img src="docs/icon.png" width="120" alt="InflectTTS Icon" />
+  <strong>Real-time English TTS using the Inflect Nano v2 model — 2.5x RT on CPU</strong>
 </p>
 
 <p align="center">
-  <strong>On-device text-to-speech using the Inflect Nano v2 model (~4M parameters)</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/owenawsong/Inflect">
-    <img src="https://img.shields.io/badge/Model-Inflect%20Nano%20v2-1769E0?style=for-the-badge" alt="Model Badge" />
+  <a href="https://github.com/nikitastaf1996/InflectTTS/releases/latest">
+    <img src="https://img.shields.io/badge/Download-APK-4CAF50?style=for-the-badge" alt="Download APK" />
   </a>
-  <a href="https://github.com/nikitastaf1996/iptv-player/releases/latest">
-    <img src="https://img.shields.io/badge/Download-APK-4CAF50?style=for-the-badge" alt="Download Badge" />
+  <a href="https://huggingface.co/owensong/Inflect-Nano-v2-ONNX">
+    <img src="https://img.shields.io/badge/Model-Inflect%20Nano%20v2%20ONNX-1769E0?style=for-the-badge" alt="Model" />
+  </a>
+  <a href="https://github.com/nikitastaf1996/InflectTTS/actions/workflows/build-apk.yml">
+    <img src="https://github.com/nikitastaf1996/InflectTTS/actions/workflows/build-apk.yml/badge.svg" alt="Build APK" />
   </a>
 </p>
 
 ---
 
-## 🎯 Overview
+## Overview
 
-InflectTTS is an Android application that demonstrates **on-device text-to-speech synthesis** using the [Inflect Nano v2](https://github.com/owenawsong/Inflect) model. This compact TTS model achieves impressive quality with only **3.97 million parameters** (~16 MB).
+InflectTTS is a React Native Android app that runs the [Inflect Nano v2](https://huggingface.co/owensong/Inflect-Nano-v2) text-to-speech model **entirely on-device** using ONNX Runtime. The model is a compact VITS-style architecture with **3.97M parameters** (~16 MB) that synthesizes 24 kHz English speech.
 
-### Key Features
+### Performance
 
-- 🔊 **Local TTS Inference** - No internet required after model is loaded
-- ⏱️ **Real-time Performance Metrics** - Detailed inference timing for each step
-- 🎛️ **Configurable Controls** - Speed, variation, and seed parameters
-- 📊 **Comprehensive Logs** - Step-by-step breakdown of the synthesis pipeline
-- 📱 **Native Audio Playback** - Real-time audio output through Android's audio engine
+| Metric | Value |
+|--------|-------|
+| **Realtime factor** | **2.5x RT** (measured on a mid-range Snapdragon phone) |
+| **Inference engine** | ONNX Runtime 1.27 + XNNPACK EP |
+| **Native calls per synthesis** | 2 (duration.onnx + decode.onnx) |
+| **APK size** | 87 MB |
+| **First-run download** | 15.5 MB (cached afterwards) |
 
-## 🧠 Model Information
+2.5x RT means a 10-second utterance synthesizes in ~4 seconds — comfortable headroom for real-time playback, pre-buffering, and thermal sustainability.
 
-| Specification | Value |
-|---------------|-------|
-| **Model** | Inflect-Nano-v2 |
-| **Parameters** | 3,966,721 |
-| **Model Size** | 15.97 MB (FP32) |
-| **Output** | 24 kHz mono WAV |
-| **Voice** | Fixed English male |
-| **CPU Throughput** | 10.72x real-time |
+## How it works
 
-### Inference Pipeline
+```
+Text → InflectG2P (rule-based IPA) → token IDs → [duration.onnx] → m_p_exp, logs_p_exp, y_mask
+                                                       ↓
+                                              sample zp_noise (seeded)
+                                                       ↓
+                              [decode.onnx] → waveform (24 kHz float32 PCM)
+                                                       ↓
+                                              AudioTrack playback
+```
 
-The TTS synthesis consists of these steps:
+The model is split into **2 ONNX graphs** (from the official [`owensong/Inflect-Nano-v2-ONNX`](https://huggingface.co/owensong/Inflect-Nano-v2-ONNX) repo):
 
-1. **Text Preprocessing** - Normalization and cleaning
-2. **Phoneme Encoding** - Convert text to phoneme sequence
-3. **Duration Prediction** - Predict how long each phoneme takes
-4. **Mel Spectrogram Generation** - Generate acoustic features
-5. **Waveform Synthesis** - Neural vocoder converts features to audio
-6. **Post-processing** - Normalization and speed adjustment
+| File | Size | Bakes in |
+|------|------|----------|
+| `duration.onnx` | 3.5 MB | TextEncoder + DurationPredictor + attention matrix + path generation + matmul expansion |
+| `decode.onnx` | 12.0 MB | z_p sampling + ResidualCouplingBlock (flow) + HiFi-GAN vocoder (dec) + max_len slicing |
 
-## 🚀 Quick Start
+The 2-graph split (vs the PyTorch submodule pathway's 4 graphs + 200 lines of Kotlin orchestration) is what enables the 2.5x RT speedup.
 
-### Prerequisites
+### Phonemization
 
-- Node.js ≥ 22.11.0
-- JDK 17
-- Android SDK (API 24+)
-- Android NDK (27.1.12297006)
+The model was trained on **eSpeak IPA phonemes** with stress markers. Since eSpeak isn't available on Android, the app uses a **rule-based English g2p** (`InflectG2P.kt`) that produces plausible IPA token IDs. Quality is lower than eSpeak (some words sound "Flemish") but the audio is recognizable English. For production-quality phonemization, bundle eSpeak NG as a native library.
 
-### Installation
+## Quick start
+
+### For users
+
+1. Download the latest APK from [Releases](https://github.com/nikitastaf1996/InflectTTS/releases/latest)
+2. Install it (allow unknown sources)
+3. Open the app — first launch downloads ~15.5 MB of ONNX model files from HuggingFace
+4. Enter text, tap **Synthesize Speech**
+
+### For developers
+
+**Prerequisites:** Node.js ≥ 22.11.0, JDK 17, Android SDK (API 24+), Android NDK (27.1.12297006)
 
 ```bash
-# Clone the repository with submodules (HF model repo is pinned as
-# a git submodule at models/Inflect-Nano-v2-Mobile/).
-git clone --recurse-submodules https://github.com/nikitastaf1996/InflectTTS.git
+git clone https://github.com/nikitastaf1996/InflectTTS.git
 cd InflectTTS
-
-# If you forgot --recurse-submodules:
-git submodule update --init --recursive
-
-# Install dependencies
 npm install
-
-# Bundle JavaScript
 npm run bundle:android
-
-# Build debug APK
 npm run build:apk
-```
-
-### First-run model download
-
-The five scripted submodule `.pt` files (`inflect_enc_p`, `inflect_dec`,
-`inflect_enc_q`, `inflect_flow`, `inflect_dp`, total ~20 MB) are **not
-bundled** in the APK. On first launch, the app fetches them directly from
-HuggingFace (`huggingface.co/nikitastaf1996/Inflect-Nano-v2-Mobile`)
-and caches them in the app's internal storage. Subsequent launches reuse
-the cache.
-
-To force a re-download, call the exposed `redownloadModel()` method on
-the native `InflectTTS` module.
-
-
-
-### Running
-
-```bash
-# Start Metro bundler
-npm start
-
-# Run on device/emulator
-npm run android
-```
-
-Or install the APK directly:
-```bash
 adb install android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## 📁 Project Structure
+No git submodules, no git-lfs, no model files in the repo — everything is downloaded at runtime.
+
+## Project structure
 
 ```
 InflectTTS/
-├── .github/
-│   └── workflows/
-│       └── build-apk.yml    # GitHub Actions: build APK + auto-release
-├── android/
-│   └── app/src/main/
-│       ├── java/com/inflecttts/
-│       │   └── tts/
-│       │       ├── TTSModule.kt        # RN native module (orchestration; real inference only, no fallback)
-│       │       ├── ModelDownloader.kt  # Pulls .pt submodules from HuggingFace on first run
-│       │       ├── InflectInference.kt # Loads .pt files, reconstructs SynthesizerTrn.infer()
-│       │       └── TTSPackage.kt       # React Native package
-│       └── assets/
-│           └── index.android.bundle
-├── models/
-│   └── Inflect-Nano-v2-Mobile/   # Git submodule → HF repo (pointer files only)
-├── scripts/
-│   └── export_onnx.py                  # Legacy ONNX export script (unused by v2.0 runtime)
-├── src/
-│   └── TTSBridge.ts                    # TypeScript bridge to native module
-├── App.tsx                             # Main React Native component
-├── package.json
-└── README.md
+├── .github/workflows/
+│   └── build-apk.yml                    # CI: build APK + auto-release
+├── android/app/src/main/java/com/inflecttts/tts/
+│   ├── TTSModule.kt                     # React Native module (orchestration + crash post-mortem)
+│   ├── ModelDownloader.kt               # Downloads .onnx files from HF on first run
+│   ├── InflectInference.kt              # ONNX Runtime: 2 sessions, 2 run() calls
+│   ├── InflectG2P.kt                    # Rule-based English → IPA token IDs
+│   └── TTSPackage.kt                    # React Native package registration
+├── src/TTSBridge.ts                     # TypeScript bridge to native module
+├── App.tsx                              # Main UI (text input, controls, logs, diagnostics)
+└── package.json
 ```
 
-## 🔧 Development
+## Native module API
 
-### v2.1 submodule pathway (no fallback)
+The `InflectTTS` native module exposes:
 
-The app uses the **scripted submodule** pathway described in the
-[HF README](https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-Mobile):
+| Method | Description |
+|--------|-------------|
+| `initializeModel()` | Downloads `.onnx` files from HF (first run only), loads ONNX sessions, initializes AudioTrack. Emits `InflectTTS_ModelProgress` events during download. |
+| `synthesize(text, speed, variation, seed)` | Runs the 2-graph inference pipeline. Rejects with `MODEL_NOT_LOADED` if the model didn't load; `SYNTHESIS_ERROR` if inference throws. |
+| `getModelInfo()` | Returns model metadata + `realModelReady` flag + `loadFailureReason`. |
+| `getDiagnostics()` | Returns detailed state: file sizes, session load status, `lastInferenceStep` (crash post-mortem), PyTorch/ONNX probe. |
+| `redownloadModel()` | Clears the cache and re-downloads the `.onnx` files. |
 
-1. **Build time** — `models/Inflect-Nano-v2-Mobile/` is a git
-   submodule pointing at the HF repo. It contains LFS pointer files
-   (132 bytes each) plus the README and Python scripts for reference.
-   CI initializes the submodule via `actions/checkout@v4` with
-   `submodules: recursive` — git-lfs is NOT required.
+### Crash post-mortem
 
-2. **Runtime (first launch)** — `ModelDownloader.kt` fetches the
-   actual LFS-backed `.pt` binaries from
-   `https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-Mobile/resolve/main/<file>`
-   and writes them to `context.filesDir/inflect_model/`. Total: ~20 MB.
+The app persists `lastInferenceStep` and `lastInferenceInputs` to SharedPreferences (synchronous `commit()`) before every native call. If a native crash (SIGSEGV) kills the process, the next launch's `getDiagnostics()` shows exactly which step crashed — no logcat access needed.
 
-3. **Runtime (subsequent launches)** — cached files are reused; no
-   network access is needed.
+## Configuration
 
-4. **Inference** — `InflectInference.kt` loads each `.pt` as a
-   `org.pytorch.Module` and runs the VITS-style pipeline:
-   `enc_p → dp → flow → dec`. If the model failed to load (network
-   error, corrupted file, TorchScript incompat, OOM, …), `synthesize()`
-   rejects with `MODEL_NOT_LOADED` and a human-readable reason stored
-   in `loadFailureReason` (surfaced via `getModelInfo()`). The legacy
-   simplified synthesizer was removed in v2.1 — the app is either
-   running the real Inflect v2 inference or it is erroring out with a
-   clear message.
+| Parameter | Range | Default | Notes |
+|-----------|-------|---------|-------|
+| `speed` | 0.5 – 2.0 | 1.0 | 1.0 = normal, 2.0 = 2x slower, 0.5 = 2x faster |
+| `variation` | 0.0 – 1.0 | 0.667 | Latent noise scale (prosodic variation) |
+| `seed` | any int | 7 | RNG seed for latent noise (same seed = same audio) |
 
-### Native Module
+## Build & CI
 
-The `TTSModule.kt` provides:
+The GitHub Actions workflow (`.github/workflows/build-apk.yml`) builds a debug APK on every push to `main` and publishes it as a prerelease at [Releases](https://github.com/nikitastaf1996/InflectTTS/releases). The APK is overwritten on every push.
 
-- `initializeModel()` — download `.pt` submodules from HF (first run only),
-  load them via PyTorch Android, initialize the audio engine. Emits
-  `InflectTTS_ModelProgress` events during download. On load failure,
-  captures a human-readable reason in `loadFailureReason`.
-- `synthesize(text, speed, variation, seed)` — **real inference only**.
-  Rejects with `MODEL_NOT_LOADED` if the model didn't load; rejects
-  with `SYNTHESIS_ERROR` (and a cause-chain message) if inference throws.
-- `redownloadModel()` — clear the cache and re-download the submodules.
-- `getModelInfo()` — model metadata + `realModelReady` flag + `engine`
-  field + `loadFailureReason` (null on success).
+## References
 
-### Legacy ONNX export (optional)
+- **Model**: [owensong/Inflect-Nano-v2-ONNX](https://huggingface.co/owensong/Inflect-Nano-v2-ONNX) — official ONNX export
+- **Original model**: [owensong/Inflect-Nano-v2](https://huggingface.co/owensong/Inflect-Nano-v2) — PyTorch base model
+- **VITS paper**: [arXiv:2106.06103](https://arxiv.org/abs/2106.06103)
+- **ONNX Runtime Android**: [onnxruntime.ai/docs/tutorials/android](https://onnxruntime.ai/docs/tutorials/android/)
 
-The repo still ships `scripts/export_onnx.py` for users who prefer the
-ONNX Runtime pathway. It is **not** used by the v2.1 runtime — the app
-loads `.pt` files via PyTorch Android instead.
+## License
 
-```bash
-pip install torch onnx huggingface_hub
-python scripts/export_onnx.py --model nano --download --output ./android/app/src/main/assets/
-```
-
-## 📈 Performance
-
-The app tracks and displays:
-
-- **Total inference time**
-- **Per-step timing** for each pipeline stage
-- **Average, min, and max inference times**
-- **Realtime factor** (how many times faster than real-time)
-
-Example output:
-```
-⏱️ Total time: 847ms
-🎵 Audio: 2.3s @ 24000Hz
-⚡ Realtime factor: 2.72x
-💾 Memory: ~16 MB
-```
-
-## 🔄 GitHub Actions
-
-The project includes a GitHub Actions workflow that:
-
-1. Builds the APK on every push to `main`
-2. Publishes to a "Latest Build" prerelease
-3. Provides direct download URL
-
-### Workflow File
-
-See [`.github/workflows/build-apk.yml`](.github/workflows/build-apk.yml) for the complete workflow.
-
-### Badge
-
-Add this to your README to show the latest build status:
-
-```markdown
-![Build APK](https://github.com/YOUR_USERNAME/InflectTTS/actions/workflows/build-apk.yml/badge.svg)
-```
-
-## 📚 Resources
-
-- [Inflect GitHub Repository](https://github.com/owenawsong/Inflect)
-- [Inflect Nano v2 on HuggingFace](https://huggingface.co/owensong/Inflect-Nano-v2)
-- [ONNX Runtime Android Documentation](https://onnxruntime.ai/docs/tutorials/android/)
-- [React Native CLI Setup](https://reactnative.dev/docs/environment-setup)
-
-## ⚠️ Limitations
-
-- The current app uses a **simplified synthesis** that demonstrates the UI and timing features
-- For production use, integrate the actual ONNX-exported Inflect model
-- Audio quality depends on the underlying model implementation
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-## 📄 License
-
-This project is licensed under the MIT License.
+MIT. The model weights inherit the license from [`owensong/Inflect-Nano-v2-ONNX`](https://huggingface.co/owensong/Inflect-Nano-v2-ONNX).
 
 ---
 
 <p align="center">
-  Built with ❤️ for on-device TTS
+  Built with ONNX Runtime + React Native — 2.5x realtime on a phone CPU
 </p>

@@ -15,7 +15,7 @@ import kotlin.math.min
 /**
  * InflectInference (ONNX Runtime version)
  *
- * Loads the two ONNX graphs from `nikitastaf1996/Inflect-Nano-v2-Mobile`
+ * Loads the two ONNX graphs from the official `owensong/Inflect-Nano-v2-ONNX`
  * and runs the inference pipeline:
  *
  *   1. duration.onnx: tokens → (m_p_exp, logs_p_exp, y_mask)
