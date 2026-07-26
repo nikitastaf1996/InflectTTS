@@ -70,15 +70,21 @@ class InflectInference(private val context: Context) {
     private val modelDir: File
         get() = File(context.filesDir, ModelDownloader.MODEL_DIR_NAME)
 
-    // The five scripted submodules, loaded lazily.
+    // The four scripted submodules used in inference, loaded lazily.
+    // NOTE: enc_q (PosteriorEncoder) is NOT loaded — it's training-only.
+    // See runtime/models.py SynthesizerTrn.infer() (lines 559-583):
+    //   infer() calls enc_p, dp, flow, dec — never enc_q.
+    // enc_q is only used in forward() (training) and voice_conversion()
+    // (which is disabled: inference_only=True raises RuntimeError).
+    // The HF README confirms: "infer() uses enc_p, not enc_q".
+    // Skipping enc_q saves ~1.2 MB download + ~4 MB native memory.
     @Volatile private var encP: Module? = null
     @Volatile private var dec: Module? = null
-    @Volatile private var encQ: Module? = null
     @Volatile private var flow: Module? = null
     @Volatile private var dp: Module? = null
     @Volatile private var isLoaded = false
 
-    /** True iff all five submodule Modules have been loaded. */
+    /** True iff all four inference submodules have been loaded. */
     fun isReady(): Boolean = isLoaded
 
     /**
@@ -168,7 +174,7 @@ class InflectInference(private val context: Context) {
         // exactly which file was being loaded when the failure happened.
         encP = loadOne("inflect_enc_p.ptl")
         dec  = loadOne("inflect_dec.ptl")
-        encQ = loadOne("inflect_enc_q.ptl")
+        // enc_q skipped — training-only, not used in infer(). See class comment.
         flow = loadOne("inflect_flow.ptl")
         dp   = loadOne("inflect_dp.ptl")
 
@@ -209,7 +215,6 @@ class InflectInference(private val context: Context) {
     fun release() {
         encP?.destroy(); encP = null
         dec?.destroy();  dec  = null
-        encQ?.destroy(); encQ = null
         flow?.destroy(); flow = null
         dp?.destroy();   dp   = null
         isLoaded = false
@@ -239,7 +244,7 @@ class InflectInference(private val context: Context) {
             "modulesLoaded" to mapOf(
                 "encP" to (encP != null),
                 "dec"  to (dec  != null),
-                "encQ" to (encQ != null),
+                "encQ" to "(skipped — training-only)",
                 "flow" to (flow != null),
                 "dp"   to (dp   != null),
             ),
@@ -264,7 +269,7 @@ class InflectInference(private val context: Context) {
         val modules = com.facebook.react.bridge.Arguments.createMap()
         modules.putBoolean("encP", encP != null)
         modules.putBoolean("dec",  dec  != null)
-        modules.putBoolean("encQ", encQ != null)
+        modules.putString("encQ", "(skipped — training-only, not used in infer())")
         modules.putBoolean("flow", flow != null)
         modules.putBoolean("dp",   dp   != null)
         m.putMap("modulesLoaded", modules)

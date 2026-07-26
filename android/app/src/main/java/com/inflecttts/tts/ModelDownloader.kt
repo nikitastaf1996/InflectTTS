@@ -33,11 +33,13 @@ import kotlin.math.min
  * Files (see HF README "Submodule TorchScript pathway"):
  *   - inflect_enc_p.ptl  (2.3 MB)  TextEncoder
  *   - inflect_dec.ptl    (8.0 MB)  Generator
- *   - inflect_enc_q.ptl  (1.2 MB)  PosteriorEncoder (smaller after optimization)
  *   - inflect_flow.ptl   (4.0 MB)  ResidualCouplingBlock
  *   - inflect_dp.ptl     (1.0 MB)  DurationPredictor
  *
- * Total: ~16.5 MB. Downloaded once, cached, and reused.
+ * NOT downloaded (training-only, unused in infer()):
+ *   - inflect_enc_q.ptl  (1.2 MB)  PosteriorEncoder — see InflectInference.kt
+ *
+ * Total: ~15.3 MB. Downloaded once, cached, and reused.
  */
 class ModelDownloader(private val context: Context) {
 
@@ -55,9 +57,15 @@ class ModelDownloader(private val context: Context) {
         const val MODEL_DIR_NAME = "inflect_model"
 
         /**
-         * The five lite-interpreter submodule files (.ptl). Order matters
-         * for the progress callback: largest first to give the user a
-         * smoother percentage.
+         * The four lite-interpreter submodule files (.ptl) used in inference.
+         * Order matters for the progress callback: largest first to give the
+         * user a smoother percentage.
+         *
+         * NOTE: inflect_enc_q.ptl is NOT downloaded — enc_q (PosteriorEncoder)
+         * is training-only and never called in SynthesizerTrn.infer().
+         * See runtime/models.py lines 559-583: infer() calls enc_p, dp, flow,
+         * dec — never enc_q. Skipping it saves ~1.2 MB download + ~4 MB
+         * native memory.
          *
          * .ptl files are produced by torch.utils.mobile_optimizer.optimize_for_mobile()
          * — they apply operator fusion, constant folding, and XNNPACK
@@ -70,7 +78,6 @@ class ModelDownloader(private val context: Context) {
             ModelFile("inflect_dec.ptl",    8_446_534L),
             ModelFile("inflect_flow.ptl",   4_154_831L),
             ModelFile("inflect_enc_p.ptl",  2_433_783L),
-            ModelFile("inflect_enc_q.ptl",  1_241_449L),
             ModelFile("inflect_dp.ptl",     1_024_525L),
         )
 
