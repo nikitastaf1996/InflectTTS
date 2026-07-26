@@ -10,6 +10,7 @@ import com.facebook.react.bridge.WritableMap
 import java.io.File
 import java.nio.LongBuffer
 import java.nio.FloatBuffer
+import kotlin.math.min
 
 /**
  * InflectInference (ONNX Runtime version)
@@ -195,11 +196,13 @@ class InflectInference(private val context: Context) {
         //   tokens: [1, seq_len] int64
         //   lengths: [1] int64
         //   length_scale: [1] float32
-        val tokensLong = LongBuffer.allocate(phonemes.size)
-        for (p in phonemes) tokensLong.put(p.toLong())
-        tokensLong.flip()
-        val tokensTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(LongArray(phonemes.size) { phonemes[it].toLong() }), longArrayOf(1, seqLen))
-        val lengthsTensor = OnnxTensor.createTensor(env, longArrayOf(seqLen), longArrayOf(1))
+        //
+        // OnnxTensor.createTensor(env, LongBuffer, long[]) creates an int64 tensor.
+        // OnnxTensor.createTensor(env, FloatBuffer, long[]) creates a float32 tensor.
+        // (There's no overload for raw arrays — must wrap in a Buffer.)
+        val tokensLongArr = LongArray(phonemes.size) { phonemes[it].toLong() }
+        val tokensTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(tokensLongArr), longArrayOf(1, seqLen))
+        val lengthsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(seqLen)), longArrayOf(1))
         val lengthScaleArr = floatArrayOf(lengthScale)
         val lengthScaleTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(lengthScaleArr), longArrayOf(1))
 
@@ -221,9 +224,10 @@ class InflectInference(private val context: Context) {
         }
 
         // Outputs: m_p_exp [1, 128, T_audio], logs_p_exp [1, 128, T_audio], y_mask [1, 1, T_audio]
-        val mPExpTensor = durationOutputs.get(0).get() as OnnxTensor
-        val logsPExpTensor = durationOutputs.get(1).get() as OnnxTensor
-        val yMaskTensor = durationOutputs.get(2).get() as OnnxTensor
+        // Result.get(int) returns OnnxValue — cast to OnnxTensor.
+        val mPExpTensor = durationOutputs.get(0) as OnnxTensor
+        val logsPExpTensor = durationOutputs.get(1) as OnnxTensor
+        val yMaskTensor = durationOutputs.get(2) as OnnxTensor
 
         val mPExpShape = mPExpTensor.info.shape
         val logsPExpShape = logsPExpTensor.info.shape
@@ -282,19 +286,31 @@ class InflectInference(private val context: Context) {
             throw RuntimeException(msg, t)
         }
 
-        val waveformTensor = decodeOutputs.get(0).get() as OnnxTensor
+        val waveformTensor = decodeOutputs.get(0) as OnnxTensor
         val waveformShape = waveformTensor.info.shape
         Log.i(TAG, "step=$lastInferenceStep: OK — waveform=${waveformShape.contentToString()}")
 
         // Extract the waveform as a float array.
-        val waveform = waveformTensor.value as Array<*>
-        // waveform shape is [1, 1, samples] — flatten to [samples]
+        // waveform shape is [1, 1, samples] — getValue() returns nested arrays.
+        val waveformObj = waveformTensor.value
         val result = FloatArray(waveformShape[2].toInt())
-        @Suppress("UNCHECKED_CAST")
-        val outer = waveform[0] as Array<*>
-        @Suppress("UNCHECKED_CAST")
-        val inner = outer[0] as FloatArray
-        System.arraycopy(inner, 0, result, 0, result.size)
+        when (waveformObj) {
+            is FloatArray -> {
+                // Flat array — direct copy
+                System.arraycopy(waveformObj, 0, result, 0, min(result.size, waveformObj.size))
+            }
+            is Array<*> -> {
+                // Nested [1, 1, samples] — unwrap two levels
+                @Suppress("UNCHECKED_CAST")
+                val outer = waveformObj[0] as Array<*>
+                @Suppress("UNCHECKED_CAST")
+                val inner = outer[0] as FloatArray
+                System.arraycopy(inner, 0, result, 0, min(result.size, inner.size))
+            }
+            else -> {
+                throw RuntimeException("Unexpected waveform type: ${waveformObj?.javaClass?.name}")
+            }
+        }
 
         // -------- Cleanup --------
         tokensTensor.close()
