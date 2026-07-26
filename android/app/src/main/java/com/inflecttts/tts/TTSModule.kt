@@ -23,7 +23,7 @@ import kotlin.random.Random
  *
  * Pipeline (v2.1 — submodule pathway, no fallback):
  *   1. On `initializeModel()`, [ModelDownloader] pulls the five scripted
- *      submodule `.pt` files from the `nikitastaf1996/Inflect-Nano-v2-TorchScript`
+ *      submodule `.ptl` files from the `nikitastaf1996/Inflect-Nano-v2-Mobile`
  *      HuggingFace repo into the app's internal storage (cached for reuse).
  *   2. [InflectInference] loads those `.pt` files via PyTorch Android and
  *      reconstructs the `SynthesizerTrn.infer()` pipeline locally.
@@ -36,7 +36,7 @@ import kotlin.random.Random
  *      is erroring out with a clear message.
  *
  * The HuggingFace repo is also pinned as a git submodule at
- * `models/Inflect-Nano-v2-TorchScript/` in this repository for source /
+ * `models/Inflect-Nano-v2-Mobile/` in this repository for source /
  * build reference. Runtime weights are downloaded from HF directly so
  * the APK does not bundle ~20 MB of LFS-backed binaries.
  */

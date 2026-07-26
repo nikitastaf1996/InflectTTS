@@ -15,7 +15,7 @@ import kotlin.math.min
  * InflectInference
  *
  * Loads the five TorchScript submodule files produced by
- * `nikitastaf1996/Inflect-Nano-v2-TorchScript` and reconstructs
+ * `nikitastaf1996/Inflect-Nano-v2-Mobile` and reconstructs
  * the `SynthesizerTrn.infer()` pipeline from `runtime/models.py`.
  *
  * Pipeline (matching the HF README "Submodule TorchScript pathway"):

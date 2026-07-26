@@ -14,8 +14,8 @@ import kotlin.math.min
 /**
  * ModelDownloader
  *
- * Pulls the five lite-interpreter submodule `.ptl` files from the
- * `nikitastaf1996/Inflect-Nano-v2-TorchScript` HuggingFace
+ * Pulls the four lite-interpreter submodule `.ptl` files from the
+ * `nikitastaf1996/Inflect-Nano-v2-Mobile` HuggingFace
  * repository into the app's internal files directory on first run.
  *
  * The `.ptl` files are produced by
@@ -47,7 +47,7 @@ class ModelDownloader(private val context: Context) {
         private const val TAG = "ModelDownloader"
 
         /** HuggingFace model repository (git submodule source). */
-        const val HF_REPO = "nikitastaf1996/Inflect-Nano-v2-TorchScript"
+        const val HF_REPO = "nikitastaf1996/Inflect-Nano-v2-Mobile"
 
         /** Raw-file URL prefix for `resolve/main/` on HuggingFace. */
         private const val HF_BASE =

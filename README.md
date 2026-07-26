@@ -66,7 +66,7 @@ The TTS synthesis consists of these steps:
 
 ```bash
 # Clone the repository with submodules (HF model repo is pinned as
-# a git submodule at models/Inflect-Nano-v2-TorchScript/).
+# a git submodule at models/Inflect-Nano-v2-Mobile/).
 git clone --recurse-submodules https://github.com/nikitastaf1996/InflectTTS.git
 cd InflectTTS
 
@@ -88,7 +88,7 @@ npm run build:apk
 The five scripted submodule `.pt` files (`inflect_enc_p`, `inflect_dec`,
 `inflect_enc_q`, `inflect_flow`, `inflect_dp`, total ~20 MB) are **not
 bundled** in the APK. On first launch, the app fetches them directly from
-HuggingFace (`huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript`)
+HuggingFace (`huggingface.co/nikitastaf1996/Inflect-Nano-v2-Mobile`)
 and caches them in the app's internal storage. Subsequent launches reuse
 the cache.
 
@@ -130,7 +130,7 @@ InflectTTS/
 │       └── assets/
 │           └── index.android.bundle
 ├── models/
-│   └── Inflect-Nano-v2-TorchScript/   # Git submodule → HF repo (pointer files only)
+│   └── Inflect-Nano-v2-Mobile/   # Git submodule → HF repo (pointer files only)
 ├── scripts/
 │   └── export_onnx.py                  # Legacy ONNX export script (unused by v2.0 runtime)
 ├── src/
@@ -145,9 +145,9 @@ InflectTTS/
 ### v2.1 submodule pathway (no fallback)
 
 The app uses the **scripted submodule** pathway described in the
-[HF README](https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript):
+[HF README](https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-Mobile):
 
-1. **Build time** — `models/Inflect-Nano-v2-TorchScript/` is a git
+1. **Build time** — `models/Inflect-Nano-v2-Mobile/` is a git
    submodule pointing at the HF repo. It contains LFS pointer files
    (132 bytes each) plus the README and Python scripts for reference.
    CI initializes the submodule via `actions/checkout@v4` with
@@ -155,7 +155,7 @@ The app uses the **scripted submodule** pathway described in the
 
 2. **Runtime (first launch)** — `ModelDownloader.kt` fetches the
    actual LFS-backed `.pt` binaries from
-   `https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-TorchScript/resolve/main/<file>`
+   `https://huggingface.co/nikitastaf1996/Inflect-Nano-v2-Mobile/resolve/main/<file>`
    and writes them to `context.filesDir/inflect_model/`. Total: ~20 MB.
 
 3. **Runtime (subsequent launches)** — cached files are reused; no
