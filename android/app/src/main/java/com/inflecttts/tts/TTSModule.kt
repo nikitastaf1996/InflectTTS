@@ -526,6 +526,7 @@ class TTSModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
                         noiseScale = variation.toFloat(),
                         lengthScale = lengthScale,
                         noiseScaleW = variation.toFloat(),
+                        seed = seed,
                     )
                 } catch (t: Throwable) {
                     // Capture the failure into the @Volatile fields BEFORE

@@ -14,32 +14,28 @@ import kotlin.math.min
 /**
  * ModelDownloader
  *
- * Pulls the four lite-interpreter submodule `.ptl` files from the
+ * Pulls the two ONNX graph files from the
  * `nikitastaf1996/Inflect-Nano-v2-Mobile` HuggingFace
  * repository into the app's internal files directory on first run.
  *
- * The `.ptl` files are produced by
- * `torch.utils.mobile_optimizer.optimize_for_mobile()` — they apply
- * operator fusion, constant folding, and XNNPACK optimizations for
- * 20-40% faster CPU inference vs. the `.pt` (full TorchScript) files.
+ * The model is split into 2 ONNX graphs (originally from
+ * owensong/Inflect-Nano-v2-ONNX, mirrored to our repo):
+ *   - decode.onnx   (12.6 MB) — flow + dec (baked into one graph)
+ *   - duration.onnx (3.6 MB)  — enc_p + dp + attention + expand (baked in)
+ *
+ * The 2-graph split means only 2 native inference calls per synthesis
+ * (vs 4 for the PyTorch submodule pathway), and the attention matrix,
+ * path generation, and matmul expansion are all baked into duration.onnx
+ * — no Kotlin orchestration needed.
  *
  * The same files are also referenced as a git submodule at
- * `models/Inflect-Nano-v2-TorchScript/` in the InflectTTS repo
+ * `models/Inflect-Nano-v2-Mobile/` in the InflectTTS repo
  * (see `.gitmodules`). The submodule path is for source / build
  * reference; the actual weights are downloaded here at runtime so
  * that the APK stays small and the LFS-backed binaries are not
  * bundled.
  *
- * Files (see HF README "Submodule TorchScript pathway"):
- *   - inflect_enc_p.ptl  (2.3 MB)  TextEncoder
- *   - inflect_dec.ptl    (8.0 MB)  Generator
- *   - inflect_flow.ptl   (4.0 MB)  ResidualCouplingBlock
- *   - inflect_dp.ptl     (1.0 MB)  DurationPredictor
- *
- * NOT downloaded (training-only, unused in infer()):
- *   - inflect_enc_q.ptl  (1.2 MB)  PosteriorEncoder — see InflectInference.kt
- *
- * Total: ~15.3 MB. Downloaded once, cached, and reused.
+ * Total download: ~16.2 MB. Downloaded once, cached, and reused.
  */
 class ModelDownloader(private val context: Context) {
 
@@ -53,32 +49,28 @@ class ModelDownloader(private val context: Context) {
         private const val HF_BASE =
             "https://huggingface.co/$HF_REPO/resolve/main/"
 
-        /** Subdirectory under `context.filesDir` where the .ptl files live. */
+        /** Subdirectory under `context.filesDir` where the .onnx files live. */
         const val MODEL_DIR_NAME = "inflect_model"
 
         /**
-         * The four lite-interpreter submodule files (.ptl) used in inference.
+         * The two ONNX graph files used in inference.
          * Order matters for the progress callback: largest first to give the
          * user a smoother percentage.
          *
-         * NOTE: inflect_enc_q.ptl is NOT downloaded — enc_q (PosteriorEncoder)
-         * is training-only and never called in SynthesizerTrn.infer().
-         * See runtime/models.py lines 559-583: infer() calls enc_p, dp, flow,
-         * dec — never enc_q. Skipping it saves ~1.2 MB download + ~4 MB
-         * native memory.
+         * The model is split into 2 ONNX graphs (from owensong/Inflect-Nano-v2-ONNX):
+         *   - decode.onnx   (12.6 MB) — flow + dec (baked into one graph)
+         *   - duration.onnx (3.6 MB)  — enc_p + dp + attention + expand (baked in)
          *
-         * .ptl files are produced by torch.utils.mobile_optimizer.optimize_for_mobile()
-         * — they apply operator fusion, constant folding, and XNNPACK
-         * optimizations. Typically 20-40% faster on CPU than .pt files.
+         * The 2-graph split means only 2 native inference calls per synthesis
+         * (vs 4 for the PyTorch submodule pathway), and the attention matrix,
+         * path generation, and matmul expansion are all baked into duration.onnx.
          *
-         * Sizes are the exact byte counts from the HF repo (verified
-         * 2026-07-25). allPresent() uses these to detect partial downloads.
+         * Sizes are the exact byte counts (verified via sha256 checksums
+         * 2026-07-26). allPresent() uses these to detect partial downloads.
          */
         val MODEL_FILES: List<ModelFile> = listOf(
-            ModelFile("inflect_dec.ptl",    8_446_534L),
-            ModelFile("inflect_flow.ptl",   4_154_831L),
-            ModelFile("inflect_enc_p.ptl",  2_433_783L),
-            ModelFile("inflect_dp.ptl",     1_024_525L),
+            ModelFile("decode.onnx",    12_570_009L),
+            ModelFile("duration.onnx",   3_636_541L),
         )
 
         /** Aggregate byte size of all submodule weights. */
@@ -139,13 +131,15 @@ class ModelDownloader(private val context: Context) {
     fun ensureModels(onProgress: (Progress) -> Unit = {}): File {
         if (!modelDir.exists()) modelDir.mkdirs()
 
-        // ---- Clean up legacy .pt files (v2.4.0 and earlier) ----
-        // The app switched from .pt to .ptl in v2.6.0. Old .pt files are
-        // ~20 MB of dead weight — delete them so they don't waste storage.
-        val legacyPtFiles = modelDir.listFiles { f -> f.name.endsWith(".pt") }
-        if (legacyPtFiles != null && legacyPtFiles.isNotEmpty()) {
-            Log.i(TAG, "Cleaning up ${legacyPtFiles.size} legacy .pt files (switching to .ptl)")
-            legacyPtFiles.forEach { f ->
+        // ---- Clean up legacy files (v2.6.x and earlier) ----
+        // The app switched from .pt/.ptl (PyTorch) to .onnx (ONNX Runtime) in v3.0.0.
+        // Old .pt and .ptl files are ~15-20 MB of dead weight — delete them.
+        val legacyFiles = modelDir.listFiles { f ->
+            f.name.endsWith(".pt") || f.name.endsWith(".ptl")
+        }
+        if (legacyFiles != null && legacyFiles.isNotEmpty()) {
+            Log.i(TAG, "Cleaning up ${legacyFiles.size} legacy .pt/.ptl files (switching to .onnx)")
+            legacyFiles.forEach { f ->
                 if (f.delete()) Log.d(TAG, "  Deleted legacy ${f.name}")
                 else Log.w(TAG, "  Failed to delete legacy ${f.name}")
             }

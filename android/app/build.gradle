@@ -82,17 +82,12 @@ android {
         applicationId "com.inflecttts"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 20
-        versionName "2.7.0"
+        versionCode 21
+        versionName "3.0.0"
     }
 
-    // PyTorch Android (transitively) and React Native both ship
-    // `com.facebook.jni.*` classes. RN wins via the per-dep `exclude`
-    // below; this configurations-level rule is a belt-and-suspenders
-    // to make sure `fbjni-java-only` is dropped from any path.
-    configurations.all {
-        exclude group: 'com.facebook.fbjni', module: 'fbjni-java-only'
-    }
+    // (PyTorch fbjni exclude removed — we no longer use PyTorch.
+    // ONNX Runtime is self-contained and doesn't conflict with RN.)
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -137,27 +132,19 @@ dependencies {
         implementation jscFlavor
     }
 
-    // PyTorch Android Lite for on-device TorchScript model inference.
+    // ONNX Runtime Android for on-device inference.
     //
-    // We use the LITE variant because the HuggingFace repo now ships both
-    // .pt (full TorchScript) AND .ptl (lite interpreter) files. The .ptl
-    // files are produced by torch.utils.mobile_optimizer.optimize_for_mobile()
-    // which applies operator fusion, constant folding, and XNNPACK-specific
-    // optimizations — typically 20-40% faster on CPU.
+    // The model is split into 2 ONNX graphs (from owensong/Inflect-Nano-v2-ONNX):
+    //   - duration.onnx (3.6 MB) — enc_p + dp + attention + expand (baked in)
+    //   - decode.onnx   (12.6 MB) — flow + dec (baked in)
     //
-    // The lite runtime can ONLY load .ptl files (not .pt). The app
-    // downloads .ptl files from HF on first run (see ModelDownloader.kt).
+    // ONNX Runtime is self-contained (no fbjni dependency, no class conflicts
+    // with React Native). The 2-graph split means only 2 native inference
+    // calls per synthesis (vs 4 for the PyTorch submodule pathway), and the
+    // attention matrix / path generation / matmul expansion are all baked
+    // into the duration.onnx graph — no Kotlin orchestration needed.
     //
-    // NOTE: 2.1.0 is the latest version published to Maven Central as of
-    // 2026-07. The HF README references 2.6.0 but that version was never
-    // published to Maven Central.
-    //
-    // The `fbjni-java-only` transitive dep from PyTorch conflicts with
-    // React Native's `fbjni:0.7.0` (both ship `com.facebook.jni.*`
-    // classes). Excluding the java-only variant lets RN's full fbjni
-    // (with native bits) win, and PyTorch's JNI calls still resolve
-    // at runtime because fbjni-0.7.0 is API-compatible.
-    implementation('org.pytorch:pytorch_android_lite:2.1.0') {
-        exclude group: 'com.facebook.fbjni', module: 'fbjni-java-only'
-    }
+    // The .onnx files are downloaded from HuggingFace on first run
+    // (see ModelDownloader.kt).
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.27.0'
 }
